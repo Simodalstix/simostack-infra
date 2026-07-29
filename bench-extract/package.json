@@ -1,0 +1,10 @@
+{
+  "name": "bench-extract",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bench listing-extraction Lambda. Calls Claude via Bedrock (IAM auth, no Anthropic API key) using the official AWS SDK.",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.712.0"
+  }
+}

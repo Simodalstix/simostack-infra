@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Bench listing-extraction function. Fetches a pasted Domain/realestate.com.au
+  URL (or accepts pasted raw text) server-side, strips it to readable text,
+  and asks Claude Haiku (via Bedrock, IAM-authenticated — no Anthropic API key
+  anywhere) for structured listing facts. No API Gateway, no VPC. The Function
+  URL has no AWS-level auth (AuthType: NONE) by design — CORS only restricts
+  *browser* callers, not direct HTTP requests, so a shared-secret header
+  (BenchAccessToken) and ReservedConcurrentExecutions raise the bar against
+  bots hitting it directly, but neither is a hard spend cap on their own — the
+  Budget + BudgetsAction below is the actual circuit breaker: once actual
+  Bedrock spend hits BudgetMonthlyLimitUsd, AWS automatically attaches a deny
+  policy to this function's execution role, so it stops being able to call
+  Bedrock at all until you manually revert the action. See repo AGENTS.md /
+  Bench proposal.
+
+Parameters:
+  BenchAccessToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      A random shared secret the frontend sends as the x-bench-token header
+      (VITE_BENCH_ACCESS_TOKEN). Not real authentication — anyone who reads
+      the JS bundle can find it — but it silently rejects the opportunistic
+      bots that scan for and hammer public Lambda Function URLs, which is
+      most of the real threat model for a personal tool nobody is targeting.
+      Generate one with e.g. `openssl rand -hex 24`.
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      VERIFY BEFORE FIRST DEPLOY. This follows Bedrock's established
+      dated-snapshot naming convention for Claude models, but Anthropic's own
+      API docs don't publish Bedrock model IDs (only the direct-API alias) —
+      confirm the exact string via `aws bedrock list-foundation-models
+      --region <BedrockRegion> --query "modelSummaries[?contains(modelId,
+      'haiku')].modelId"` or the Bedrock console's Model catalog, and update
+      this parameter if it differs.
+  BedrockRegion:
+    Type: String
+    Default: ap-southeast-2
+    Description: >
+      Region to call Bedrock in. Defaults to the same region as the rest of
+      this stack, but newer models often land in us-east-1/us-west-2 before
+      reaching ap-southeast-2 — if BedrockModelId isn't available here yet,
+      point this at a region where it is (the Lambda can call Bedrock
+      cross-region fine; it just adds a little latency).
+  BudgetMonthlyLimitUsd:
+    Type: Number
+    Default: 5
+    Description: >
+      The actual hard cap. Once this month's real Bedrock spend (account-wide,
+      not just this function) reaches this amount, the BudgetsAction below
+      automatically attaches a deny-bedrock policy to this function's role.
+      Set it comfortably above your own expected usage so it only ever trips
+      on abuse, not on you.
+  AlertEmail:
+    Type: String
+    Description: >
+      Email for budget notifications: an early warning at 80% of
+      BudgetMonthlyLimitUsd, and a second notification when the deny action
+      actually fires at 100%. AWS sends a subscription-confirmation email
+      after deploy — it must be clicked once before notifications work.
+
+Resources:
+  BenchExtractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bench-extract
+      Runtime: nodejs20.x
+      Handler: index.handler
+      CodeUri: .
+      MemorySize: 256
+      Timeout: 15
+      # Bounds the maximum concurrent (and therefore per-minute) request rate
+      # against the public Function URL. This limits how FAST spend can
+      # accumulate, not how MUCH total — the Budget/BudgetsAction below is
+      # what actually stops it.
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          BENCH_ACCESS_TOKEN: !Ref BenchAccessToken
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_REGION: !Ref BedrockRegion
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub 'arn:aws:bedrock:${BedrockRegion}::foundation-model/${BedrockModelId}'
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins:
+            - https://simostack.com
+            - https://www.simostack.com
+            - http://localhost:5173
+            - http://localhost:5199
+          AllowMethods:
+            - POST
+            - OPTIONS
+          AllowHeaders:
+            - content-type
+            - x-bench-token
+          MaxAge: 300
+
+  # Attached automatically to the function's execution role when the budget
+  # action fires. A Deny always wins over the function's own Allow, so the
+  # function itself keeps existing and its Function URL keeps responding —
+  # it just gets a Bedrock AccessDenied on every call until this policy is
+  # detached again (console: Budgets > Actions > Revert, or `aws budgets
+  # describe-budget-actions` + a manual detach).
+  BenchDenyBedrockPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Emergency deny, attached by the Bench budget action on overspend.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: '*'
+
+  # Service role AWS Budgets assumes to actually attach/detach the deny
+  # policy above. Scoped narrowly: it can only touch this one function's
+  # role and this one managed policy, nothing else in the account.
+  BenchBudgetActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: apply-bench-deny-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListPolicyVersions
+                Resource:
+                  # SAM's implicit execution role for BenchExtractFunction is
+                  # logical ID "<FunctionLogicalId>Role" — documented SAM
+                  # behaviour, not a resource this template declares directly.
+                  # If BenchExtractFunction ever gets an explicit `Role:`
+                  # property, update this reference to match.
+                  - !GetAtt BenchExtractFunctionRole.Arn
+                  - !Ref BenchDenyBedrockPolicy
+
+  BenchBedrockBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: bench-bedrock-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref BudgetMonthlyLimitUsd
+          Unit: USD
+        CostFilters:
+          Service:
+            - Amazon Bedrock
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  BenchBudgetAction:
+    Type: AWS::Budgets::BudgetsAction
+    Properties:
+      BudgetName: !Ref BenchBedrockBudget
+      ActionType: APPLY_IAM_POLICY
+      ApprovalModel: AUTOMATIC
+      NotificationType: ACTUAL
+      ActionThreshold:
+        ActionThresholdValue: 100
+        ActionThresholdType: PERCENTAGE
+      Definition:
+        IamActionDefinition:
+          PolicyArn: !Ref BenchDenyBedrockPolicy
+          Roles:
+            - !Ref BenchExtractFunctionRole
+      ExecutionRoleArn: !GetAtt BenchBudgetActionRole.Arn
+      Subscribers:
+        - SubscriptionType: EMAIL
+          Address: !Ref AlertEmail
+
+Outputs:
+  BenchExtractFunctionUrl:
+    Description: >
+      Set this as VITE_BENCH_EXTRACT_URL in the frontend's env. Lambda Function
+      URLs handle the OPTIONS preflight and CORS response headers automatically
+      per the Cors block above — no manual CORS code in the handler.
+    Value: !GetAtt BenchExtractFunction.FunctionUrl
