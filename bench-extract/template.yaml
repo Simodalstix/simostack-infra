@@ -3,17 +3,24 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   Bench listing-extraction function. Fetches a pasted Domain/realestate.com.au
   URL (or accepts pasted raw text) server-side, strips it to readable text,
-  and asks Claude Haiku (via Bedrock, IAM-authenticated — no Anthropic API key
+  and asks Claude Haiku (via Bedrock, IAM-authenticated: no Anthropic API key
   anywhere) for structured listing facts. No API Gateway, no VPC. The Function
-  URL has no AWS-level auth (AuthType: NONE) by design — CORS only restricts
+  URL has no AWS-level auth (AuthType: NONE) by design. CORS only restricts
   *browser* callers, not direct HTTP requests, so a shared-secret header
-  (BenchAccessToken) and ReservedConcurrentExecutions raise the bar against
-  bots hitting it directly, but neither is a hard spend cap on their own — the
-  Budget + BudgetsAction below is the actual circuit breaker: once actual
-  Bedrock spend hits BudgetMonthlyLimitUsd, AWS automatically attaches a deny
-  policy to this function's execution role, so it stops being able to call
-  Bedrock at all until you manually revert the action. See repo AGENTS.md /
-  Bench proposal.
+  (BenchAccessToken), a fetch-target allowlist in index.mjs, and
+  ReservedConcurrentExecutions raise the bar against bots hitting it directly,
+  but none of those is a hard spend cap on its own. Two circuit breakers are:
+
+    - BenchHighInvocationAlarm (fast, ~1-3 min): watches the Invocations
+      metric and sets reserved concurrency to 0, stopping the function dead.
+      Reacts to request volume, not dollars.
+    - Budget + BudgetsAction (slow, 6-24h): once actual Bedrock spend hits
+      BudgetMonthlyLimitUsd, AWS attaches a deny policy to this function's
+      execution role. Accurate about dollars, but lags.
+
+  Neither self-heals; both are reverted by hand on purpose. A separate
+  email-only budget at EarlyWarningBudgetUsd warns long before either fires.
+  Reasoning and the deploy-time checklist live in the repo's SECURITY.md.
 
 Parameters:
   BenchAccessToken:
@@ -21,8 +28,8 @@ Parameters:
     NoEcho: true
     Description: >
       A random shared secret the frontend sends as the x-bench-token header
-      (VITE_BENCH_ACCESS_TOKEN). Not real authentication — anyone who reads
-      the JS bundle can find it — but it silently rejects the opportunistic
+      (VITE_BENCH_ACCESS_TOKEN). Not real authentication, since anyone
+      who reads the JS bundle can find it, but it silently rejects opportunistic
       bots that scan for and hammer public Lambda Function URLs, which is
       most of the real threat model for a personal tool nobody is targeting.
       Generate one with e.g. `openssl rand -hex 24`.
@@ -32,7 +39,7 @@ Parameters:
     Description: >
       VERIFY BEFORE FIRST DEPLOY. This follows Bedrock's established
       dated-snapshot naming convention for Claude models, but Anthropic's own
-      API docs don't publish Bedrock model IDs (only the direct-API alias) —
+      API docs don't publish Bedrock model IDs (only the direct-API alias), so
       confirm the exact string via `aws bedrock list-foundation-models
       --region <BedrockRegion> --query "modelSummaries[?contains(modelId,
       'haiku')].modelId"` or the Bedrock console's Model catalog, and update
@@ -43,7 +50,7 @@ Parameters:
     Description: >
       Region to call Bedrock in. Defaults to the same region as the rest of
       this stack, but newer models often land in us-east-1/us-west-2 before
-      reaching ap-southeast-2 — if BedrockModelId isn't available here yet,
+      reaching ap-southeast-2. If BedrockModelId isn't available here yet,
       point this at a region where it is (the Lambda can call Bedrock
       cross-region fine; it just adds a little latency).
   BudgetMonthlyLimitUsd:
@@ -55,13 +62,23 @@ Parameters:
       automatically attaches a deny-bedrock policy to this function's role.
       Set it comfortably above your own expected usage so it only ever trips
       on abuse, not on you.
+  EarlyWarningBudgetUsd:
+    Type: Number
+    Default: 1
+    Description: >
+      A second, much lower budget that only sends email. It attaches no deny
+      policy and stops nothing. Its whole job is to tell you that spend has
+      started moving while the number is still small, so you find out from a
+      $1 note rather than from the $5 circuit breaker tripping. Set it just
+      above a normal month's usage.
   AlertEmail:
     Type: String
     Description: >
-      Email for budget notifications: an early warning at 80% of
-      BudgetMonthlyLimitUsd, and a second notification when the deny action
-      actually fires at 100%. AWS sends a subscription-confirmation email
-      after deploy — it must be clicked once before notifications work.
+      Email for budget and alarm notifications: the EarlyWarningBudgetUsd
+      warning, an 80% warning on BudgetMonthlyLimitUsd, a notification when
+      the deny action fires at 100%, and the invocation-rate alarm below. AWS
+      sends a subscription-confirmation email per topic/budget after deploy,
+      and each must be clicked once before notifications work.
 
 Resources:
   BenchExtractFunction:
@@ -75,9 +92,11 @@ Resources:
       Timeout: 15
       # Bounds the maximum concurrent (and therefore per-minute) request rate
       # against the public Function URL. This limits how FAST spend can
-      # accumulate, not how MUCH total — the Budget/BudgetsAction below is
-      # what actually stops it.
-      ReservedConcurrentExecutions: 2
+      # accumulate, not how MUCH total. The Budget/BudgetsAction below is
+      # what actually stops it. 1, not 2: this is a single-user tool, nobody
+      # is ever adding two listings at once, and halving concurrency halves
+      # the worst-case burn rate for zero practical cost.
+      ReservedConcurrentExecutions: 1
       Environment:
         Variables:
           BENCH_ACCESS_TOKEN: !Ref BenchAccessToken
@@ -107,8 +126,8 @@ Resources:
 
   # Attached automatically to the function's execution role when the budget
   # action fires. A Deny always wins over the function's own Allow, so the
-  # function itself keeps existing and its Function URL keeps responding —
-  # it just gets a Bedrock AccessDenied on every call until this policy is
+  # function itself keeps existing and its Function URL keeps responding.
+  # It just gets a Bedrock AccessDenied on every call until this policy is
   # detached again (console: Budgets > Actions > Revert, or `aws budgets
   # describe-budget-actions` + a manual detach).
   BenchDenyBedrockPolicy:
@@ -150,7 +169,7 @@ Resources:
                   - iam:ListPolicyVersions
                 Resource:
                   # SAM's implicit execution role for BenchExtractFunction is
-                  # logical ID "<FunctionLogicalId>Role" — documented SAM
+                  # logical ID "<FunctionLogicalId>Role", documented SAM
                   # behaviour, not a resource this template declares directly.
                   # If BenchExtractFunction ever gets an explicit `Role:`
                   # property, update this reference to match.
@@ -188,6 +207,156 @@ Resources:
             - SubscriptionType: EMAIL
               Address: !Ref AlertEmail
 
+  # ---------------------------------------------------------------------
+  # Fast kill switch.
+  #
+  # The Budget action above is the *authoritative* spend cap, but it runs on
+  # Cost Explorer data and can lag 6-24 hours behind reality, long enough for
+  # a runaway loop to spend well past the limit before anything reacts. This
+  # alarm watches the Lambda's own Invocations metric instead, which lands in
+  # CloudWatch within about a minute, and slams reserved concurrency to 0,
+  # which is the only setting that stops the function outright.
+  #
+  # Read the two as a pair: this one is fast and dumb (it counts requests, not
+  # dollars), the Budget one is slow and accurate.
+  # ---------------------------------------------------------------------
+
+  BenchInvocationAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: bench-extract-invocation-alarm
+      DisplayName: Bench invocation alarm
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # NOTE ON THE THRESHOLD: Invocations counts *every* request that reaches the
+  # function, including the sub-millisecond 401s from bots that don't have the
+  # token. Those are nearly free (they never reach Bedrock), so this alarm is
+  # a "traffic is abnormal" detector, not a spend meter. That is deliberate:
+  # abnormal traffic is the leading indicator, and the cost of a false trip is
+  # one manual command to turn the tool back on.
+  #
+  # For scale: with ReservedConcurrentExecutions at 1 and a real extraction
+  # taking several seconds, legitimate use cannot physically reach 100 calls
+  # in 5 minutes. Crossing this line means something automated is hitting it.
+  BenchHighInvocationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: bench-extract-high-invocations
+      AlarmDescription: >
+        More than 100 invocations of bench-extract in 5 minutes. Sets the
+        function's reserved concurrency to 0 (hard stop) and emails. Recovery
+        is manual and deliberate. See README.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BenchExtractFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      # A function nobody is calling emits no datapoints at all. Without this,
+      # the alarm sits in INSUFFICIENT_DATA rather than OK, which is noisy and
+      # makes it harder to tell "quiet" from "broken".
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BenchInvocationAlarmTopic
+
+  # Deliberately has no OK action / no auto-recovery: if this fired, a human
+  # should look at why before the endpoint is live again. Same philosophy as
+  # the Budget deny policy, which also has to be reverted by hand.
+  BenchKillSwitchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bench-extract-kill-switch
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TARGET_FUNCTION_NAME: !Ref BenchExtractFunction
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:PutFunctionConcurrency
+              Resource: !GetAtt BenchExtractFunction.Arn
+      # SAM turns this into both the SNS subscription and the invoke
+      # permission for the topic.
+      Events:
+        AlarmFired:
+          Type: SNS
+          Properties:
+            Topic: !Ref BenchInvocationAlarmTopic
+      # CommonJS, not ESM: InlineCode is written out as index.js with no
+      # package.json, so the runtime treats it as CommonJS and `import` would
+      # fail at load. The AWS SDK v3 is preinstalled in the nodejs20.x runtime,
+      # so there is nothing to bundle.
+      InlineCode: |
+        const { LambdaClient, PutFunctionConcurrencyCommand } = require('@aws-sdk/client-lambda')
+
+        const lambda = new LambdaClient({})
+
+        exports.handler = async (event) => {
+          const target = process.env.TARGET_FUNCTION_NAME
+          // Reserved concurrency of 0 is the one control that makes a Lambda
+          // stop running immediately: every further invocation is throttled
+          // before any code executes, so nothing reaches Bedrock.
+          await lambda.send(
+            new PutFunctionConcurrencyCommand({
+              FunctionName: target,
+              ReservedConcurrentExecutions: 0,
+            }),
+          )
+          console.log(
+            `Bench kill switch: set ReservedConcurrentExecutions=0 on ${target}.`,
+            JSON.stringify(event),
+          )
+        }
+
+  # Email-only early warning, separate from the $5 enforcement budget above.
+  # A budget that both warns and enforces has to be set at the pain threshold,
+  # which means the first thing you hear about creeping spend is the circuit
+  # breaker. Splitting them lets the warning sit low and the cap sit high.
+  BenchBedrockEarlyWarningBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: bench-bedrock-early-warning
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref EarlyWarningBudgetUsd
+          Unit: USD
+        CostFilters:
+          Service:
+            - Amazon Bedrock
+      NotificationsWithSubscribers:
+        # ACTUAL: spend that has already happened.
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        # FORECASTED: AWS projecting the month will end over this line. Only
+        # worth having on the low budget. On the enforcement budget it would
+        # cry wolf, but here it is the earliest possible signal.
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
   BenchBudgetAction:
     Type: AWS::Budgets::BudgetsAction
     Properties:
@@ -213,5 +382,5 @@ Outputs:
     Description: >
       Set this as VITE_BENCH_EXTRACT_URL in the frontend's env. Lambda Function
       URLs handle the OPTIONS preflight and CORS response headers automatically
-      per the Cors block above — no manual CORS code in the handler.
+      per the Cors block above, so no manual CORS code in the handler.
     Value: !GetAtt BenchExtractFunction.FunctionUrl

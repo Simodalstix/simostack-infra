@@ -2,7 +2,7 @@
 //
 // Bench's listing-extraction Lambda. Request/response shapes and the
 // extraction prompt are a fixed contract with the frontend's add-listing
-// flow (src/components/bench/AddListingFlow.vue) — do not change field names
+// flow (src/components/bench/AddListingFlow.vue). Do not change field names
 // on either side without updating both.
 //
 // Calls Claude via Amazon Bedrock, not the direct Anthropic API: auth is IAM
@@ -12,23 +12,55 @@
 // official AWS SDK, a materially different supply-chain risk than a random
 // npm package.
 //
-// The Function URL itself has no AWS-level auth (see template.yaml) — CORS
-// only stops browser callers, not bots hitting it directly — so every
-// request must carry the shared-secret x-bench-token header checked below.
+// The Function URL itself has no AWS-level auth (see template.yaml). CORS
+// only stops browser callers, not bots hitting it directly, so every
+// request must carry the shared-secret x-bench-token header checked below,
+// and any URL it is asked to fetch must pass assertAllowedUrl. See
+// ../../SECURITY.md for why each guardrail exists and what it does not cover.
 
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
 
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID
 const BENCH_ACCESS_TOKEN = process.env.BENCH_ACCESS_TOKEN
 const MAX_PAGE_TEXT_CHARS = 15000
+const MAX_PAGE_BYTES = 2 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 8000
 const BEDROCK_TIMEOUT_MS = 10000
+
+// Without this allowlist the handler is an open fetch proxy: it takes a URL
+// from an unauthenticated caller, fetches it server-side on AWS's network,
+// and hands the body back. Restricting it to the two sites Bench actually
+// supports means the endpoint can't be used to fetch arbitrary third-party
+// content on someone else's behalf. https only, because an http URL would
+// also make the fetch trivially interceptable.
+//
+// domain.com.au is the verified-working pair; realestate.com.au is kept
+// because it is already wired up, not because it has been tested against a
+// real listing. Don't widen this list without a reason.
+//
+// REDIRECTS ARE FOLLOWED, deliberately. fetch's default is to follow, and
+// an allowlisted host could in principle redirect somewhere else. That is
+// acceptable only because this function is INTENTIONALLY kept outside a
+// VPC: Bench needs no private resources (no RDS, no internal services), so
+// there is nothing on a private network for a redirect to reach, and Lambda
+// exposes no EC2-style metadata endpoint. There is no drawback to staying
+// outside a VPC and it is what makes following redirects safe.
+//
+// If a future Bench feature ever needs VPC access, that reasoning collapses
+// and this must be re-reviewed at that point: the fix is redirect: 'manual'
+// with assertAllowedUrl re-run on every hop. See ../../SECURITY.md.
+const ALLOWED_LISTING_HOSTS = [
+  'domain.com.au',
+  'www.domain.com.au',
+  'realestate.com.au',
+  'www.realestate.com.au',
+]
 
 const bedrock = new BedrockRuntimeClient({ region: process.env.BEDROCK_REGION })
 
 const EXTRACTION_PROMPT = `You extract structured facts from an Australian real-estate listing page.
-Input is raw page text (may include navigation cruft, ads, agent bios —
-ignore anything not describing the property itself).
+Input is raw page text (may include navigation cruft, ads, agent bios; ignore
+anything not describing the property itself).
 
 Return ONLY a JSON object with exactly these keys, no prose, no markdown fences:
 {
@@ -77,6 +109,9 @@ export const handler = async (event) => {
     try {
       fetched = await fetchListingPage(url)
     } catch (err) {
+      // A rejected URL is the caller's mistake (400); anything else is the
+      // upstream site failing on us (502).
+      if (err.statusCode === 400) return jsonResponse(400, { error: err.message })
       return jsonResponse(502, { error: `Could not fetch that URL: ${err.message}` })
     }
     pageText = extractReadableText(fetched)
@@ -108,14 +143,51 @@ function parseBody(event) {
 }
 
 // Function URL events lowercase header names in practice, but that isn't a
-// documented guarantee — check case-insensitively rather than trusting it.
+// documented guarantee, so check case-insensitively rather than trusting it.
 function findHeader(event, name) {
   const headers = event.headers || {}
   const key = Object.keys(headers).find((k) => k.toLowerCase() === name.toLowerCase())
   return key ? headers[key] : undefined
 }
 
+// Throws a 400-flagged error (rather than the 502 an upstream failure gets)
+// so a caller pasting the wrong link is told what's wrong, not handed a
+// generic "could not fetch".
+export function assertAllowedUrl(rawUrl) {
+  let parsed
+  try {
+    parsed = new URL(rawUrl)
+  } catch {
+    throw clientError('That does not look like a URL. Paste a full listing link, or the page text.')
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw clientError(`Listing URLs must be https, not ${parsed.protocol.replace(':', '')}.`)
+  }
+
+  // URL already lowercases the hostname, so an exact match is enough. Match
+  // the host exactly rather than by suffix: an endsWith check would also
+  // accept notdomain.com.au and evil-domain.com.au.
+  if (!ALLOWED_LISTING_HOSTS.includes(parsed.hostname)) {
+    throw clientError(
+      `${parsed.hostname} is not a supported listing site. Paste a link from ${ALLOWED_LISTING_HOSTS.join(' / ')}, or paste the page text instead.`,
+    )
+  }
+
+  return parsed
+}
+
+function clientError(message) {
+  const err = new Error(message)
+  err.statusCode = 400
+  return err
+}
+
 async function fetchListingPage(url) {
+  // Checked here rather than in the handler so the restriction travels with
+  // the fetch, so a future second call site can't skip it by accident.
+  assertAllowedUrl(url)
+
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
   try {
@@ -128,15 +200,68 @@ async function fetchListingPage(url) {
       },
     })
     if (!res.ok) throw new Error(`upstream returned ${res.status}`)
-    return await res.text()
+
+    // A listing page is tens to low hundreds of KB. Anything past 2MB is not
+    // a listing, and buffering it costs memory and time for nothing.
+    //
+    // Two paths, because a chunked response declares no length at all:
+    // reject up front when the server tells us the size, otherwise count
+    // bytes as they arrive and bail mid-stream. Note that a missing header
+    // reads as null, and Number(null) is 0, which is finite -- so the
+    // presence check has to be explicit rather than folded into isFinite.
+    const declaredHeader = res.headers.get('content-length')
+    if (declaredHeader !== null) {
+      const declaredBytes = Number(declaredHeader)
+      if (Number.isFinite(declaredBytes) && declaredBytes > MAX_PAGE_BYTES) {
+        throw new Error(
+          `page is ${Math.round(declaredBytes / 1024 / 1024)}MB, over the ${MAX_PAGE_BYTES / 1024 / 1024}MB limit`,
+        )
+      }
+      return await res.text()
+    }
+
+    return await readCapped(res)
   } finally {
     clearTimeout(timer)
   }
 }
 
+// Read a response that declared no content-length, counting bytes as they
+// arrive and giving up once the running total passes the same 2MB ceiling.
+// Bailing mid-stream matters more than the check itself: it means an
+// oversized body is never fully buffered, so memory stays bounded whatever
+// the server sends. cancel() releases the socket instead of leaving it to
+// drain in the background.
+async function readCapped(res) {
+  if (!res.body) return ''
+
+  const reader = res.body.getReader()
+  const chunks = []
+  let total = 0
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      total += value.byteLength
+      if (total > MAX_PAGE_BYTES) {
+        throw new Error(
+          `page passed the ${MAX_PAGE_BYTES / 1024 / 1024}MB limit while streaming (no content-length given)`,
+        )
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.cancel().catch(() => {})
+  }
+
+  return Buffer.concat(chunks).toString('utf-8')
+}
+
 // Pull title/meta description/og: tags to the front (often carry a concise
 // price/address summary), strip script/style blocks, strip remaining tags,
-// collapse whitespace. A naive regex strip is fine here — this is a best-
+// collapse whitespace. A naive regex strip is fine here: this is a best-
 // effort text extraction feeding an LLM, not a rendering pipeline.
 export function extractReadableText(html) {
   const metaBits = []
@@ -183,7 +308,7 @@ async function extractListingFacts(pageText) {
 
   const retry = await callBedrock(
     buildUserMessage(pageText) +
-      '\n\nYour last response was not valid JSON — return ONLY the JSON object, no prose, no markdown fences.',
+      '\n\nYour last response was not valid JSON. Return ONLY the JSON object, no prose, no markdown fences.',
   )
   const retryParsed = tryParseJson(retry)
   if (retryParsed) return retryParsed
@@ -217,7 +342,11 @@ async function callBedrock(userMessage) {
       new ConverseCommand({
         modelId: BEDROCK_MODEL_ID,
         messages: [{ role: 'user', content: [{ text: userMessage }] }],
-        inferenceConfig: { maxTokens: 512 },
+        // The JSON contract is small, but a listing with several warnings can
+        // run past 512 and get truncated mid-object, which reads as invalid
+        // JSON and burns the retry below on a response that was fine. 1024 is
+        // still far under the model's output ceiling.
+        inferenceConfig: { maxTokens: 1024 },
       }),
       { abortSignal: controller.signal },
     )
@@ -230,12 +359,14 @@ async function callBedrock(userMessage) {
 }
 
 // Coerce or null out anything malformed rather than trusting model output
-// blindly — missing evidence is null, never a guess, same rule this repo
+// blindly. Missing evidence is null, never a guess, the same rule this repo
 // applies to Turf's hand-maintained records.
 export function validateExtraction(raw) {
   const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null)
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
-  const warnings = Array.isArray(raw.warnings) ? raw.warnings.filter((w) => typeof w === 'string') : []
+  const warnings = Array.isArray(raw.warnings)
+    ? raw.warnings.filter((w) => typeof w === 'string')
+    : []
 
   return {
     address: str(raw.address),
