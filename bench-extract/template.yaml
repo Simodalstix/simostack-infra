@@ -106,7 +106,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: bench-extract
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Handler: index.handler
       CodeUri: .
       MemorySize: 256
@@ -307,7 +307,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: bench-extract-kill-switch
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Handler: index.handler
       Timeout: 30
       MemorySize: 128
@@ -329,7 +329,7 @@ Resources:
             Topic: !Ref BenchInvocationAlarmTopic
       # CommonJS, not ESM: InlineCode is written out as index.js with no
       # package.json, so the runtime treats it as CommonJS and `import` would
-      # fail at load. The AWS SDK v3 is preinstalled in the nodejs20.x runtime,
+      # fail at load. The AWS SDK v3 is preinstalled in the nodejs24.x runtime,
       # so there is nothing to bundle.
       InlineCode: |
         const { LambdaClient, PutFunctionConcurrencyCommand } = require('@aws-sdk/client-lambda')
