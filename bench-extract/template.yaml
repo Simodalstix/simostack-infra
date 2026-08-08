@@ -1,25 +1,32 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
+# The stack Description below is deliberately short: CloudFormation caps that
+# field at 1024 characters and rejects the template outright above it. The full
+# rationale lives here in comments instead, which cost nothing and are the
+# first thing a reader sees anyway.
+#
+# The Function URL has no AWS-level auth (AuthType: NONE) by design. CORS only
+# restricts *browser* callers, not direct HTTP requests, so a shared-secret
+# header (BenchAccessToken), a fetch-target allowlist in index.mjs, and
+# ReservedConcurrentExecutions raise the bar against bots hitting it directly.
+# None of those is a hard spend cap on its own. Two circuit breakers are:
+#
+#   - BenchHighInvocationAlarm (fast, ~1-3 min): watches the Invocations
+#     metric and sets reserved concurrency to 0, stopping the function dead.
+#     Reacts to request volume, not dollars.
+#   - Budget + BudgetsAction (slow, 6-24h): once actual Bedrock spend hits
+#     BudgetMonthlyLimitUsd, AWS attaches a deny policy to this function's
+#     execution role. Accurate about dollars, but lags.
+#
+# Neither self-heals; both are reverted by hand on purpose. A separate
+# email-only budget at EarlyWarningBudgetUsd warns long before either fires.
 Description: >
   Bench listing-extraction function. Fetches a pasted Domain/realestate.com.au
   URL (or accepts pasted raw text) server-side, strips it to readable text,
   and asks Claude Haiku (via Bedrock, IAM-authenticated: no Anthropic API key
   anywhere) for structured listing facts. No API Gateway, no VPC. The Function
-  URL has no AWS-level auth (AuthType: NONE) by design. CORS only restricts
-  *browser* callers, not direct HTTP requests, so a shared-secret header
-  (BenchAccessToken), a fetch-target allowlist in index.mjs, and
-  ReservedConcurrentExecutions raise the bar against bots hitting it directly,
-  but none of those is a hard spend cap on its own. Two circuit breakers are:
-
-    - BenchHighInvocationAlarm (fast, ~1-3 min): watches the Invocations
-      metric and sets reserved concurrency to 0, stopping the function dead.
-      Reacts to request volume, not dollars.
-    - Budget + BudgetsAction (slow, 6-24h): once actual Bedrock spend hits
-      BudgetMonthlyLimitUsd, AWS attaches a deny policy to this function's
-      execution role. Accurate about dollars, but lags.
-
-  Neither self-heals; both are reverted by hand on purpose. A separate
-  email-only budget at EarlyWarningBudgetUsd warns long before either fires.
+  URL is public by design and guarded by a shared-secret header, a fetch
+  allowlist, and two spend circuit breakers. See the comments above.
   Reasoning and the deploy-time checklist live in the repo's SECURITY.md.
 
 Parameters:
@@ -35,24 +42,38 @@ Parameters:
       Generate one with e.g. `openssl rand -hex 24`.
   BedrockModelId:
     Type: String
+    Default: au.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      The AU cross-region inference profile for Claude Haiku 4.5, not the bare
+      foundation-model ID. The `au.` prefix is the geography: this profile
+      routes only within ap-southeast-2 and ap-southeast-4, so inference stays
+      in Australia. There is also a `global.` variant that routes worldwide;
+      it is deliberately not used here. Verified against
+      `aws bedrock get-inference-profile --region ap-southeast-2
+      --inference-profile-identifier au.anthropic.claude-haiku-4-5-20251001-v1:0`
+      on 2026-08-08 (status ACTIVE). If you change this, update
+      BedrockFoundationModelId and the region pair in the IAM policy below to
+      match, since the profile's routing targets are what the policy grants.
+  BedrockFoundationModelId:
+    Type: String
     Default: anthropic.claude-haiku-4-5-20251001-v1:0
     Description: >
-      VERIFY BEFORE FIRST DEPLOY. This follows Bedrock's established
-      dated-snapshot naming convention for Claude models, but Anthropic's own
-      API docs don't publish Bedrock model IDs (only the direct-API alias), so
-      confirm the exact string via `aws bedrock list-foundation-models
-      --region <BedrockRegion> --query "modelSummaries[?contains(modelId,
-      'haiku')].modelId"` or the Bedrock console's Model catalog, and update
-      this parameter if it differs.
+      The underlying foundation model BedrockModelId routes to, which is the
+      same string without the `au.` geography prefix. Kept as its own parameter
+      because IAM needs it separately: invoking through an inference profile is
+      authorized against the profile ARN AND the foundation-model ARN in every
+      region the profile can route to, so the policy below names all three.
+      Granting only the profile ARN produces an AccessDenied at call time.
   BedrockRegion:
     Type: String
     Default: ap-southeast-2
     Description: >
-      Region to call Bedrock in. Defaults to the same region as the rest of
-      this stack, but newer models often land in us-east-1/us-west-2 before
-      reaching ap-southeast-2. If BedrockModelId isn't available here yet,
-      point this at a region where it is (the Lambda can call Bedrock
-      cross-region fine; it just adds a little latency).
+      Region to call Bedrock in. Must be one of the two regions the AU
+      inference profile spans (ap-southeast-2 or ap-southeast-4), because the
+      `au.` profile only exists there. This is no longer a free choice the way
+      a bare foundation-model ID was: pointing it at us-east-1 to chase model
+      availability would fail to resolve the profile, and would defeat the
+      point of using an AU-scoped profile in the first place.
   BudgetMonthlyLimitUsd:
     Type: Number
     Default: 5
@@ -103,11 +124,22 @@ Resources:
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           BEDROCK_REGION: !Ref BedrockRegion
       Policies:
+        # Three ARNs, not one, because the call goes through an inference
+        # profile: Bedrock authorizes it against the profile the request names
+        # AND the foundation model it actually lands on, in whichever region it
+        # routes to. The two foundation-model regions are hardcoded rather than
+        # derived from BedrockRegion because they are a property of the `au.`
+        # profile (it can route to Melbourne even when called in Sydney), not
+        # of where this stack happens to run. Foundation-model ARNs carry no
+        # account ID; the profile ARN does.
         - Statement:
             - Effect: Allow
               Action:
                 - bedrock:InvokeModel
-              Resource: !Sub 'arn:aws:bedrock:${BedrockRegion}::foundation-model/${BedrockModelId}'
+              Resource:
+                - !Sub 'arn:aws:bedrock:${BedrockRegion}:${AWS::AccountId}:inference-profile/${BedrockModelId}'
+                - !Sub 'arn:aws:bedrock:ap-southeast-2::foundation-model/${BedrockFoundationModelId}'
+                - !Sub 'arn:aws:bedrock:ap-southeast-4::foundation-model/${BedrockFoundationModelId}'
       FunctionUrlConfig:
         AuthType: NONE
         Cors:
@@ -116,9 +148,12 @@ Resources:
             - https://www.simostack.com
             - http://localhost:5173
             - http://localhost:5199
+          # POST only. The Function URL answers the OPTIONS preflight itself
+          # from this Cors block, and OPTIONS is not a legal AllowMethods value
+          # (the schema enumerates GET/PUT/HEAD/POST/PATCH/DELETE/*), so
+          # listing it fails the deploy rather than adding preflight support.
           AllowMethods:
             - POST
-            - OPTIONS
           AllowHeaders:
             - content-type
             - x-bench-token
@@ -364,17 +399,24 @@ Resources:
       ActionType: APPLY_IAM_POLICY
       ApprovalModel: AUTOMATIC
       NotificationType: ACTUAL
+      # Value/Type, not ActionThresholdValue/ActionThresholdType. The Budgets
+      # SDK and API use the longer names; the CloudFormation resource schema
+      # sets additionalProperties:false over Value/Type, so the API spelling is
+      # rejected at stack-create rather than ignored.
       ActionThreshold:
-        ActionThresholdValue: 100
-        ActionThresholdType: PERCENTAGE
+        Value: 100
+        Type: PERCENTAGE
       Definition:
         IamActionDefinition:
           PolicyArn: !Ref BenchDenyBedrockPolicy
           Roles:
             - !Ref BenchExtractFunctionRole
       ExecutionRoleArn: !GetAtt BenchBudgetActionRole.Arn
+      # Type, not SubscriptionType. AWS::Budgets::Budget's subscriber uses
+      # SubscriptionType and BudgetsAction's uses Type; the two resources
+      # genuinely differ, so this does not match the Notification block above.
       Subscribers:
-        - SubscriptionType: EMAIL
+        - Type: EMAIL
           Address: !Ref AlertEmail
 
 Outputs:
@@ -383,4 +425,8 @@ Outputs:
       Set this as VITE_BENCH_EXTRACT_URL in the frontend's env. Lambda Function
       URLs handle the OPTIONS preflight and CORS response headers automatically
       per the Cors block above, so no manual CORS code in the handler.
-    Value: !GetAtt BenchExtractFunction.FunctionUrl
+    # BenchExtractFunctionUrl, not BenchExtractFunction: FunctionUrlConfig makes
+    # SAM emit a separate AWS::Lambda::Url resource named <Function>Url, and
+    # FunctionUrl is an attribute of that, not of the function. Confirmed
+    # against the transformed template, not assumed from the naming convention.
+    Value: !GetAtt BenchExtractFunctionUrl.FunctionUrl

@@ -50,17 +50,30 @@ Nothing in `template.yaml` can do these for you, and they are invisible to code
 review. Do them first, per account and per region.
 
 - **Enable Bedrock model access for Claude Haiku only** (Bedrock console →
-  Model access), in whichever region `BedrockRegion` points at. This is what
-  makes the IAM policy's model-scoped `Resource` ARN meaningful rather than
-  decorative. A blanket enable removes a whole layer, and Opus-tier pricing is
-  roughly an order of magnitude above Haiku's.
-- **Confirm the model ID and its regional availability:**
+  Model access) in `ap-southeast-2`. Keep it to Haiku: a blanket enable removes
+  a whole layer, and Opus-tier pricing is roughly an order of magnitude above
+  Haiku's.
+
+  You do **not** also need it in `ap-southeast-4`, the profile's other routing
+  target. Melbourne is an opt-in region and is currently disabled on this
+  account, and the `au.` profile still resolves and serves from Sydney
+  regardless (verified 2026-08-08 with a live Converse call). Practically the
+  profile is Sydney-only today, so it buys the AU data-residency guarantee but
+  not the extra burst capacity cross-region inference normally gives you. If
+  you ever opt into Melbourne (`aws account get-region-opt-status
+  --region-name ap-southeast-4` to check), enable Haiku access there too and
+  the second region starts carrying load. The IAM policy already grants it, so
+  nothing in the template needs to change.
+- **Confirm the inference profile and its routing targets:**
   ```bash
-  aws bedrock list-foundation-models --region ap-southeast-2 \
-    --query "modelSummaries[?contains(modelId, 'haiku')].modelId"
+  aws bedrock get-inference-profile --region ap-southeast-2 \
+    --inference-profile-identifier au.anthropic.claude-haiku-4-5-20251001-v1:0
   ```
-  Newer models often land in `us-east-1`/`us-west-2` first, so point
-  `BedrockRegion` there if needed. Cross-region calls work fine, just slower.
+  The `models[].modelArn` values it returns are exactly the foundation-model
+  ARNs the IAM policy grants; if that list ever changes, the policy needs the
+  same edit. `BedrockRegion` must stay inside the profile's geography
+  (`ap-southeast-2` or `ap-southeast-4`) — unlike a bare foundation-model ID,
+  it can't be repointed at `us-east-1` to chase availability.
 - **Lower the Bedrock on-demand rate quota** to roughly 1-2x realistic personal
   usage. Do this early, not during an incident: the Service Quotas console form
   is built for _increases_, and a decrease generally needs a support case.
@@ -75,8 +88,11 @@ sam build
 sam deploy --guided
 ```
 
-Guided mode prompts for `BenchAccessToken`, `BedrockModelId`, `BedrockRegion`,
-`BudgetMonthlyLimitUsd`, `EarlyWarningBudgetUsd` and `AlertEmail`.
+Guided mode prompts for `BenchAccessToken`, `BedrockModelId`,
+`BedrockFoundationModelId`, `BedrockRegion`, `BudgetMonthlyLimitUsd`,
+`EarlyWarningBudgetUsd` and `AlertEmail`. The two model parameters are the same
+string with and without the `au.` prefix: the profile the request names, and the
+underlying model IAM has to authorize it against. Change one, change both.
 
 Two prompts are worth knowing about in advance:
 

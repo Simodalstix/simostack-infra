@@ -20,6 +20,10 @@
 
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
 
+// An inference profile ID (`au.anthropic.…`), not a bare foundation-model ID.
+// Converse takes either in modelId; the profile keeps routing inside Australia
+// and is what the execution role is scoped to. Don't strip the `au.` prefix
+// here without widening the IAM policy in template.yaml to match.
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID
 const BENCH_ACCESS_TOKEN = process.env.BENCH_ACCESS_TOKEN
 const MAX_PAGE_TEXT_CHARS = 15000
@@ -34,9 +38,20 @@ const BEDROCK_TIMEOUT_MS = 10000
 // content on someone else's behalf. https only, because an http URL would
 // also make the fetch trivially interceptable.
 //
-// domain.com.au is the verified-working pair; realestate.com.au is kept
-// because it is already wired up, not because it has been tested against a
-// real listing. Don't widen this list without a reason.
+// NEITHER SITE IS CURRENTLY FETCHABLE, and no header tweak changes that.
+// Both sit behind bot protection that fingerprints the TLS handshake and
+// HTTP/2 framing rather than reading the User-Agent, so a server-side client
+// is rejected at the CDN edge before the request reaches an origin: Domain
+// answers 403 from Akamai Bot Manager, realestate.com.au answers 429 from
+// what looks like Kasada. Verified 2026-08-08 from a residential IP as well
+// as from Lambda, with browser User-Agent and full browser header set, so it
+// is neither the UA nor the AWS-origin address. An earlier note here called
+// Domain "the verified-working pair"; that was wrong and is corrected.
+//
+// The allowlist stays because the URL path still exists and still needs
+// bounding, but rawText is the working input and the UI now leads with it.
+// Getting URL entry working again means Domain's official developer API,
+// not a better scraper. Don't widen this list without a reason.
 //
 // REDIRECTS ARE FOLLOWED, deliberately. fetch's default is to follow, and
 // an allowlisted host could in principle redirect somewhere else. That is
@@ -112,7 +127,18 @@ export const handler = async (event) => {
       // A rejected URL is the caller's mistake (400); anything else is the
       // upstream site failing on us (502).
       if (err.statusCode === 400) return jsonResponse(400, { error: err.message })
-      return jsonResponse(502, { error: `Could not fetch that URL: ${err.message}` })
+      // Both allowlisted sites block server-side fetching outright (see the
+      // allowlist comment above), so in practice this is not a transient
+      // upstream blip and "retry" is not useful advice. Say what actually
+      // works instead, and hand the UI a stable code so it can switch to the
+      // paste step without string-matching this sentence. The raw upstream
+      // status stays on `detail` for debugging, out of the user's way.
+      return jsonResponse(502, {
+        error:
+          'Domain and realestate.com.au block automated fetching. Paste the listing text instead.',
+        code: 'URL_FETCH_BLOCKED',
+        detail: err.message,
+      })
     }
     pageText = extractReadableText(fetched)
   } else {
