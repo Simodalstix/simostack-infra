@@ -1,9 +1,14 @@
 # bench-extract
 
 Backend for Bench's "+ Add listing" flow. One Lambda behind a Function URL
-(no API Gateway, no VPC). Given a pasted Domain/realestate.com.au URL or raw
-listing text, it fetches/reads the text server-side and asks Claude Haiku
-(via Amazon Bedrock) for structured listing facts as JSON.
+(no API Gateway, no VPC). Given raw listing text, or a Domain /
+realestate.com.au URL it fetches server-side, it asks Claude Haiku (via Amazon
+Bedrock) for structured listing facts as JSON.
+
+**Pasted text is the working input.** Both allowlisted sites block server-side
+fetching at the CDN edge, so the URL path returns `URL_FETCH_BLOCKED` every
+time and the UI leads with paste. The allowlist comment in `index.mjs` has the
+evidence and what it would take to fix; it is not repeated here.
 
 `index.mjs` is the request/response contract. Keep it byte-for-byte in sync
 with `src/components/bench/AddListingFlow.vue`.
@@ -59,11 +64,15 @@ review. Do them first, per account and per region.
   account, and the `au.` profile still resolves and serves from Sydney
   regardless (verified 2026-08-08 with a live Converse call). Practically the
   profile is Sydney-only today, so it buys the AU data-residency guarantee but
-  not the extra burst capacity cross-region inference normally gives you. If
-  you ever opt into Melbourne (`aws account get-region-opt-status
-  --region-name ap-southeast-4` to check), enable Haiku access there too and
-  the second region starts carrying load. The IAM policy already grants it, so
-  nothing in the template needs to change.
+  not the extra burst capacity cross-region inference normally gives you. If you
+  ever opt into Melbourne, enable Haiku access there too and the second region
+  starts carrying load. The IAM policy already grants it, so nothing in the
+  template needs to change. To check whether it is opted in:
+
+  ```bash
+  aws account get-region-opt-status --region-name ap-southeast-4
+  ```
+
 - **Confirm the inference profile and its routing targets:**
   ```bash
   aws bedrock get-inference-profile --region ap-southeast-2 \
@@ -77,8 +86,14 @@ review. Do them first, per account and per region.
 - **Lower the Bedrock on-demand rate quota** to roughly 1-2x realistic personal
   usage. Do this early, not during an incident: the Service Quotas console form
   is built for _increases_, and a decrease generally needs a support case.
-- **Generate the access token:** `openssl rand -hex 24`. It is `NoEcho: true`
-  so it never appears in stack logs.
+- **Seed the access token in SSM Parameter Store**, in the deploy region. The
+  template takes the parameter NAME and resolves it to the value at deploy
+  time, so the stack fails at validation if this does not exist yet:
+
+  ```bash
+  aws ssm put-parameter --name /bench/access-token --type String \
+    --value "$(openssl rand -hex 24)" --region ap-southeast-2
+  ```
 
 ### Deploy
 
@@ -88,11 +103,16 @@ sam build
 sam deploy --guided
 ```
 
-Guided mode prompts for `BenchAccessToken`, `BedrockModelId`,
+Guided mode prompts for `BenchAccessTokenParameterName`, `BedrockModelId`,
 `BedrockFoundationModelId`, `BedrockRegion`, `BudgetMonthlyLimitUsd`,
 `EarlyWarningBudgetUsd` and `AlertEmail`. The two model parameters are the same
 string with and without the `au.` prefix: the profile the request names, and the
 underlying model IAM has to authorize it against. Change one, change both.
+
+`BenchAccessTokenParameterName` defaults to `/bench/access-token` and is the
+SSM parameter's **name**, not the token. Accept the default and CloudFormation
+fetches the value itself, so the token is never typed at a prompt and never
+lands in `samconfig.toml`.
 
 Two prompts are worth knowing about in advance:
 
@@ -111,16 +131,28 @@ Two prompts are worth knowing about in advance:
 If one ever gains a `RoleName` or `ManagedPolicyName`, CloudFormation starts
 demanding `CAPABILITY_NAMED_IAM` instead, and the error does not explain why.
 
-Saving answers to `samconfig.toml` is safe. The file is gitignored (root
-`.gitignore`), so the real token will not be committed, and it makes subsequent
-deploys a bare `sam build && sam deploy` with the capability already recorded.
+Saving answers to `samconfig.toml` is worth doing: it makes subsequent deploys
+a bare `sam build && sam deploy` with the capability already recorded. What it
+saves is the SSM parameter's name, never the token, since the token is only
+ever resolved by CloudFormation at deploy time. The file stays gitignored
+anyway, because it records the stack name, region and alert email.
 
 ### After deploy
 
+- Run `scripts/post-deploy.sh` from the repo root. It prints the Function URL
+  and says whether your local `.env` still matches. The URL only changes when
+  the Lambda is replaced rather than updated in place, and when that happens
+  nothing errors: the site keeps calling the old URL and every extraction fails
+  as a network error that reads like a Lambda fault. Exit code 2 means they
+  differ, so update `.env` and the GitHub Actions secret.
 - `sam deploy` prints `BenchExtractFunctionUrl`. Set it as
   `VITE_BENCH_EXTRACT_URL`, and the token as `VITE_BENCH_ACCESS_TOKEN`, in a
-  local `.env` and as GitHub Actions secrets for
-  [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml).
+  local `.env` (`cp .env.example .env` at the repo root, then fill both in) and
+  as GitHub Actions secrets for
+  [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml). The
+  root `.gitignore` covers `.env` and `.env.*`, so the filled-in copy stays
+  local. Leaving both unset is also fine: the add-listing flow falls back to
+  stand-in data and spends nothing.
 - **Confirm every `AlertEmail` subscription.** The two budgets and the SNS
   alarm topic each send their own confirmation link, and each is silent until
   clicked. Check they show `Confirmed`; do not assume.
@@ -128,6 +160,39 @@ deploys a bare `sam build && sam deploy` with the capability already recorded.
   domains (currently `simostack.com` / `www.simostack.com`).
 - Pick real values for `BudgetMonthlyLimitUsd` and `EarlyWarningBudgetUsd`. The
   defaults (5 and 1) are placeholders.
+
+## Access token
+
+`BenchAccessToken` lives in SSM Parameter Store (`/bench/access-token`,
+ap-southeast-2), not in `samconfig.toml` and not at a `--guided` prompt.
+`template.yaml` takes the parameter name and CloudFormation resolves it to the
+value at deploy time.
+
+It is a plain `String`, not a `SecureString`, for two reasons. The technical
+one: `AWS::SSM::Parameter::Value<String>` does not accept a SecureString, and
+`{{resolve:ssm-secure}}` is restricted to an allowlist of resource properties
+that excludes Lambda environment variables, so a SecureString cannot reach
+`BENCH_ACCESS_TOKEN` through this template at all. The honest one: this value
+is inlined into the public JS bundle as `VITE_BENCH_ACCESS_TOKEN` and is
+readable by anyone who loads the site, so encrypting it at rest would be
+protecting something already published. SSM is here for the rotation
+workflow, not for secrecy. What actually bounds abuse is the Bedrock quota,
+`ReservedConcurrentExecutions`, the kill switch and the budget action.
+
+**Rotating it:**
+
+1. ```bash
+   aws ssm put-parameter --name /bench/access-token --type String \
+     --value "$(openssl rand -hex 24)" --overwrite --region ap-southeast-2
+   ```
+2. Update `VITE_BENCH_ACCESS_TOKEN` in the local `.env`.
+3. Update the `VITE_BENCH_ACCESS_TOKEN` GitHub Actions secret.
+4. `sam build && sam deploy`, no prompts expected.
+
+Order matters on the way out. The Lambda starts rejecting the old token the
+moment step 4 lands, so the deployed site keeps sending the old one until the
+next build ships step 3. Either accept a window of failed extractions or push
+a rebuild straight after deploying.
 
 ## Before every subsequent deploy
 
@@ -159,9 +224,6 @@ After the budget action fired: Budgets → Actions → Revert, in the console.
   run against `template.yaml`; review it for typos before deploying.
   `extractReadableText`/`validateExtraction` were exercised locally against
   canned fixtures; the real Bedrock call has not been.
-- `realestate.com.au` is in the fetch allowlist because it was already wired
-  up, not because it has been tested against a real listing. `domain.com.au` is
-  the verified-working pair.
 - The alarm → SNS → kill-switch chain has not been exercised end to end. Worth
   one deliberate test after deploy (temporarily drop the alarm threshold, or
   invoke `bench-extract-kill-switch` directly) to confirm it can actually set

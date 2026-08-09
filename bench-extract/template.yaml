@@ -7,7 +7,7 @@ Transform: AWS::Serverless-2016-10-31
 #
 # The Function URL has no AWS-level auth (AuthType: NONE) by design. CORS only
 # restricts *browser* callers, not direct HTTP requests, so a shared-secret
-# header (BenchAccessToken), a fetch-target allowlist in index.mjs, and
+# header (BenchAccessTokenParameterName), a fetch-target allowlist in index.mjs, and
 # ReservedConcurrentExecutions raise the bar against bots hitting it directly.
 # None of those is a hard spend cap on its own. Two circuit breakers are:
 #
@@ -30,16 +30,33 @@ Description: >
   Reasoning and the deploy-time checklist live in the repo's SECURITY.md.
 
 Parameters:
-  BenchAccessToken:
-    Type: String
-    NoEcho: true
+  # The SSM parameter NAME, not the token itself. CloudFormation resolves the
+  # name to its value at deploy time, so the token never has to be typed at a
+  # --guided prompt or saved into samconfig.toml, and rotating it is one
+  # put-parameter plus a redeploy. The parameter must already exist in the
+  # deploy region or the stack fails at validation with "does not exist".
+  #
+  # Plain String, deliberately not SecureString. Two reasons. The technical
+  # one: AWS::SSM::Parameter::Value<String> does not support SecureString, and
+  # {{resolve:ssm-secure}} is only allowed in an allowlist of resource
+  # properties that does not include Lambda environment variables, so a
+  # SecureString could not reach BENCH_ACCESS_TOKEN through this template at
+  # all. The honest one: this value is inlined into the public JS bundle as
+  # VITE_BENCH_ACCESS_TOKEN and is readable by anyone who loads the site, so
+  # encrypting it at rest with KMS would protect a value that is already
+  # published. Store it in SSM for the rotation workflow, not for secrecy.
+  BenchAccessTokenParameterName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /bench/access-token
     Description: >
-      A random shared secret the frontend sends as the x-bench-token header
-      (VITE_BENCH_ACCESS_TOKEN). Not real authentication, since anyone
-      who reads the JS bundle can find it, but it silently rejects opportunistic
-      bots that scan for and hammer public Lambda Function URLs, which is
-      most of the real threat model for a personal tool nobody is targeting.
-      Generate one with e.g. `openssl rand -hex 24`.
+      Name of the SSM parameter holding the shared secret the frontend sends as
+      the x-bench-token header (VITE_BENCH_ACCESS_TOKEN). Not real
+      authentication, since anyone who reads the JS bundle can find it, but it
+      silently rejects opportunistic bots that scan for and hammer public
+      Lambda Function URLs, which is most of the real threat model for a
+      personal tool nobody is targeting. Seed it with e.g.
+      `aws ssm put-parameter --name /bench/access-token --type String
+      --value "$(openssl rand -hex 24)" --region ap-southeast-2`.
   BedrockModelId:
     Type: String
     Default: au.anthropic.claude-haiku-4-5-20251001-v1:0
@@ -110,7 +127,17 @@ Resources:
       Handler: index.handler
       CodeUri: .
       MemorySize: 256
-      Timeout: 15
+      # Must cover index.mjs's own worst case, which is FETCH_TIMEOUT_MS (8s)
+      # plus TWO BEDROCK_TIMEOUT_MS calls (10s each) when the first response
+      # is not valid JSON and the retry fires: 28s, plus cold start and JSON
+      # handling. At the previous value of 15 the function was killed
+      # mid-retry, so the retry path could only ever complete if the first
+      # Bedrock call happened to return in about 5s, and the caller got a
+      # Function URL timeout instead of the 422 the handler carefully returns.
+      # A normal extraction finishes in about 3s and is unaffected: this is a
+      # ceiling, not a target, and billing is per ms actually used.
+      # Change either constant in index.mjs and revisit this number.
+      Timeout: 30
       # Bounds the maximum concurrent (and therefore per-minute) request rate
       # against the public Function URL. This limits how FAST spend can
       # accumulate, not how MUCH total. The Budget/BudgetsAction below is
@@ -120,7 +147,9 @@ Resources:
       ReservedConcurrentExecutions: 1
       Environment:
         Variables:
-          BENCH_ACCESS_TOKEN: !Ref BenchAccessToken
+          # Resolves to the parameter's VALUE, not its name: that is what the
+          # AWS::SSM::Parameter::Value<String> type does to a !Ref.
+          BENCH_ACCESS_TOKEN: !Ref BenchAccessTokenParameterName
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           BEDROCK_REGION: !Ref BedrockRegion
       Policies:
