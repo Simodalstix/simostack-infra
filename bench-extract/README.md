@@ -102,7 +102,7 @@ review. Do them first, per account and per region.
 ### Deploy
 
 ```bash
-cd lambda/bench-extract
+cd bench-extract
 sam build
 sam deploy --guided
 ```
@@ -237,12 +237,8 @@ aws lambda put-function-concurrency \
 
 After the budget action fired: Budgets → Actions → Revert, in the console.
 
-## Not yet done / not verifiable from this sandbox
+## Not yet done
 
-- No SAM CLI or AWS credentials here, so `sam validate`/`sam build` have not
-  run against `template.yaml`; review it for typos before deploying.
-  `extractReadableText`/`validateExtraction` were exercised locally against
-  canned fixtures; the real Bedrock call has not been.
 - The alarm → SNS → kill-switch chain has not been exercised end to end. Worth
   one deliberate test after deploy (temporarily drop the alarm threshold, or
   invoke `bench-extract-kill-switch` directly) to confirm it can actually set

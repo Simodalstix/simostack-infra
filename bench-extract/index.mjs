@@ -1,4 +1,4 @@
-// lambda/bench-extract/index.mjs
+// bench-extract/index.mjs
 //
 // Bench's listing-extraction Lambda. Request/response shapes and the
 // extraction prompt are a fixed contract with the frontend's add-listing
