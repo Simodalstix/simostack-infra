@@ -10,12 +10,15 @@ fetching at the CDN edge, so the URL path returns `URL_FETCH_BLOCKED` every
 time and the UI leads with paste. The allowlist comment in `index.mjs` has the
 evidence and what it would take to fix; it is not repeated here.
 
-`index.mjs` is the request/response contract. Keep it byte-for-byte in sync
-with `src/components/bench/AddListingFlow.vue`.
+`index.mjs` is the request/response contract. Its consumer lives in the
+frontend repo (`vue-simostack`) at `src/components/bench/AddListingFlow.vue`.
+Keep the two byte-for-byte in sync. Nothing enforces this across the repo
+boundary, so a change to the contract here is only half a change until that
+file is updated too.
 
 **This file is the procedure: how to deploy it and what to do when a circuit
 breaker fires.** The reasoning behind every guardrail, the threat model and the
-known gaps live in [`SECURITY.md`](../../SECURITY.md) at the repo root. Read
+known gaps live in `SECURITY.md` at the root of the `vue-simostack` repo. Read
 that before changing a guardrail; read this before deploying one.
 
 ## Why Bedrock, not the direct Anthropic API
@@ -139,20 +142,34 @@ anyway, because it records the stack name, region and alert email.
 
 ### After deploy
 
-- Run `scripts/post-deploy.sh` from the repo root. It prints the Function URL
-  and says whether your local `.env` still matches. The URL only changes when
-  the Lambda is replaced rather than updated in place, and when that happens
-  nothing errors: the site keeps calling the old URL and every extraction fails
-  as a network error that reads like a Lambda fault. Exit code 2 means they
-  differ, so update `.env` and the GitHub Actions secret.
-- `sam deploy` prints `BenchExtractFunctionUrl`. Set it as
-  `VITE_BENCH_EXTRACT_URL`, and the token as `VITE_BENCH_ACCESS_TOKEN`, in a
-  local `.env` (`cp .env.example .env` at the repo root, then fill both in) and
-  as GitHub Actions secrets for
-  [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml). The
-  root `.gitignore` covers `.env` and `.env.*`, so the filled-in copy stays
-  local. Leaving both unset is also fine: the add-listing flow falls back to
-  stand-in data and spends nothing.
+The deploy ends in this repo but the result is consumed in another one. There
+is no pipeline across that boundary: the Function URL is carried over by hand,
+and nothing will tell you if you skip it.
+
+- `sam deploy` prints `BenchExtractFunctionUrl`. That value, plus the access
+  token, has to be set by hand in the frontend repo (`vue-simostack`) in two
+  places, because the site reads them at build time as
+  `VITE_BENCH_EXTRACT_URL` and `VITE_BENCH_ACCESS_TOKEN`:
+  1. As GitHub Actions repo secrets on `vue-simostack`, which is what the
+     deployed site is built with.
+  2. In a local `.env` there (`cp .env.example .env` at that repo's root),
+     which is what `npm run dev` reads. Its `.gitignore` covers `.env` and
+     `.env.*`, so the filled-in copy stays local.
+
+  Leaving both unset is also fine: the add-listing flow falls back to stand-in
+  data and spends nothing.
+- Then run `scripts/post-deploy.sh` from the root of `vue-simostack` (the
+  script lives there, not here, because the check it performs is a comparison
+  against that repo's `.env`). It prints the Function URL from the stack and
+  says whether the local `.env` still matches. The URL only changes when the
+  Lambda is replaced rather than updated in place, and when that happens
+  nothing errors: the site keeps calling the old URL and every extraction
+  fails as a network error that reads like a Lambda fault. Exit code 2 means
+  they differ, so update the `.env` and the GitHub Actions secret.
+
+  Note that the script only checks the local `.env`. A stale GitHub Actions
+  secret is invisible to it and to every local test, and shows up only as a
+  broken deployed site, so update the secret in the same sitting.
 - **Confirm every `AlertEmail` subscription.** The two budgets and the SNS
   alarm topic each send their own confirmation link, and each is silent until
   clicked. Check they show `Confirmed`; do not assume.
@@ -185,8 +202,9 @@ workflow, not for secrecy. What actually bounds abuse is the Bedrock quota,
    aws ssm put-parameter --name /bench/access-token --type String \
      --value "$(openssl rand -hex 24)" --overwrite --region ap-southeast-2
    ```
-2. Update `VITE_BENCH_ACCESS_TOKEN` in the local `.env`.
-3. Update the `VITE_BENCH_ACCESS_TOKEN` GitHub Actions secret.
+2. Update `VITE_BENCH_ACCESS_TOKEN` in the local `.env` in `vue-simostack`.
+3. Update the `VITE_BENCH_ACCESS_TOKEN` GitHub Actions secret on
+   `vue-simostack`.
 4. `sam build && sam deploy`, no prompts expected.
 
 Order matters on the way out. The Lambda starts rejecting the old token the
