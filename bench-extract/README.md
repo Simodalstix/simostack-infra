@@ -18,7 +18,7 @@ file is updated too.
 
 **This file is the procedure: how to deploy it and what to do when a circuit
 breaker fires.** The reasoning behind every guardrail, the threat model and the
-known gaps live in `SECURITY.md` at the root of the `vue-simostack` repo. Read
+known gaps live in [`SECURITY.md`](../SECURITY.md) at this repo's root. Read
 that before changing a guardrail; read this before deploying one.
 
 ## Why Bedrock, not the direct Anthropic API
@@ -31,7 +31,8 @@ so one Budget alert covers both. Only dependency: the official
 ## What bounds spend
 
 Four layers, fastest to slowest. Layer 1 is account-level and not in this
-template; the rest are. See SECURITY.md for why each is shaped this way.
+template; the rest are. See [`SECURITY.md`](../SECURITY.md) for why each is
+shaped this way.
 
 1. **Bedrock Service Quota**, enforced synchronously on every `InvokeModel`
    call and the only layer with no lag.

@@ -14,6 +14,14 @@ repo is deployed by that pipeline, and nothing here is deployed by CI at all.
 | `bench-extract` | Lambda + Function URL. Listing extraction via Bedrock. | Deployed, live |
 | `bench-auth`    | Cognito setup for Bench auth.                     | Placeholder, not built |
 
+## Before adding a public endpoint
+
+[`SECURITY.md`](./SECURITY.md) is the threat model and the reasoning behind
+every guardrail on `bench-extract`, plus a design checklist for the next
+service that puts a metered AI call behind a public URL. It applies to the
+repo, not to that one Lambda. Read it before writing such an endpoint or
+loosening an existing one's guardrails.
+
 ## How deploys work
 
 By hand, per service, from that service's directory:
