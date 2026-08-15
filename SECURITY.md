@@ -1,13 +1,19 @@
 # SECURITY.md: public endpoints that call a metered AI API
 
-Why each guardrail on `lambda/bench-extract/` exists and what it does not
+Why each guardrail on the Bench extraction Lambda exists and what it does not
 cover, kept separate from the procedure because a guardrail whose reasoning is
 lost gets deleted by whoever next finds it inconvenient.
 
+The Lambda itself now lives in the separate `simostack-infra` repo, under
+`bench-extract/`. This file stayed here, which is worth knowing about: the
+code and the reasoning behind its guardrails are one repo apart, so a change
+to `template.yaml` over there does not surface this file to whoever is making
+it.
+
 Read this before writing a new public endpoint or changing an existing one's
 guardrails. **Deploy steps, account setup and the incident runbook are in
-[`lambda/bench-extract/README.md`](./lambda/bench-extract/README.md)**, which
-is the one to open when you are about to deploy.
+`bench-extract/README.md` in `simostack-infra`**, which is the one to open
+when you are about to deploy.
 
 ## The threat model
 
@@ -148,8 +154,8 @@ the number is still interesting rather than alarming.
 Neither circuit breaker self-heals, deliberately. If one fired, something was
 wrong and a human should find out what before the endpoint is live again.
 
-The recovery commands are in the
-[Lambda README](./lambda/bench-extract/README.md#incident-recovery), along with
+The recovery commands are in the Lambda README (`bench-extract/README.md` in
+`simostack-infra`, "Incident recovery"), along with
 the drift warning that matters most: the kill switch changes concurrency
 outside CloudFormation, so a routine `sam deploy` silently reopens the
 endpoint.
