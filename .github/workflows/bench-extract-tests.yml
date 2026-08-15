@@ -1,0 +1,44 @@
+name: bench-extract tests
+
+# Per-service workflow, named for the service it covers. Services here deploy
+# separately by hand and own their own package.json, so a single repo-wide
+# "test" job would either need to know every service's directory or force a
+# workspace at the root, which `sam build` does not want. A second service
+# gets a second file rather than another branch inside this one.
+on:
+  push:
+    paths:
+      - 'bench-extract/**'
+      - '.github/workflows/bench-extract-tests.yml'
+  pull_request:
+    paths:
+      - 'bench-extract/**'
+      - '.github/workflows/bench-extract-tests.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: bench-extract
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # Matches the Runtime in template.yaml. Local development is on 22,
+          # so this is the only place the code is exercised on the version
+          # that actually runs it in production.
+          node-version: 24
+          cache: npm
+          # The lockfile is not at the repo root, and the cache step resolves
+          # this path from the root regardless of the working-directory above.
+          cache-dependency-path: bench-extract/package-lock.json
+
+      - run: npm ci
+
+      # No AWS credentials and no network. The Bedrock client is aliased to a
+      # stub in vitest.config.js, so this stays a pure unit run.
+      - run: npm test
