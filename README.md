@@ -68,4 +68,3 @@ URL and access token get set by hand as GitHub Actions secrets on
 commits before the split are the original ones and still describe paths under
 `lambda/bench-extract/`. Blame and log work; paths in old commit messages do
 not resolve against this tree.
-# simostack-infra
