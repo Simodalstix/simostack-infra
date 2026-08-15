@@ -1,0 +1,15 @@
+node_modules
+*.log
+.DS_Store
+
+# SAM build artifacts and local deploy config, per service. samconfig.toml
+# carries deploy parameters: stack name, region, alert email and the NAME of
+# the SSM parameter holding a service's access token. Not the token itself,
+# which CloudFormation resolves from SSM at deploy time and which never gets
+# written here.
+#
+# These are matched at any depth rather than per-service, so a new service
+# directory is covered the day it is created rather than the day someone
+# remembers to add it here.
+**/.aws-sam/
+**/samconfig.toml
