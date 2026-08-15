@@ -1,10 +1,16 @@
 // Test-only stand-in for @aws-sdk/client-bedrock-runtime.
 //
 // index.mjs imports the SDK at module scope and constructs a client there, so
-// importing it in a test needs the specifier to resolve. The SDK is a
-// dependency of the Lambda's own package.json, not the site's, and it is not
-// installed at the repo root. Aliasing it here keeps the pure functions
-// testable without adding a 3MB AWS dependency to the frontend's tree.
+// importing it in a test pulls the SDK in whether or not the test touches
+// Bedrock. Aliasing it to this file (see vitest.config.js) keeps the pure
+// functions testable without the real client.
+//
+// The real SDK is a declared dependency of this package and would resolve on
+// its own, so the alias is about isolation rather than resolution: the tests
+// stay hermetic, and a test that starts calling Bedrock fails on the throw
+// below instead of quietly trying to reach AWS. This reasoning was different
+// while the Lambda lived in vue-simostack, where the SDK was not installed at
+// all and the alias was the only thing making the import resolve.
 //
 // Nothing here is exercised: these tests only cover functions that never call
 // Bedrock. If a test ever needs a real Converse response, give the stub a

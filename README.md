@@ -23,6 +23,18 @@ cd bench-extract
 sam build && sam deploy
 ```
 
+Tests run the same way, per service, from that service's directory:
+
+```bash
+cd bench-extract
+npm install && npm test
+```
+
+Each service owns its own `package.json`, lockfile and vitest config. There is
+no npm workspace at the root on purpose: workspaces hoist `node_modules`
+upward, and `sam build` copies a service directory expecting its dependencies
+to resolve from inside it.
+
 There is deliberately no root-level stack tying the services together, and no
 CI deploy. These are low-traffic services deployed a handful of times a year;
 a pipeline would be more machinery than the problem justifies. The tradeoff is

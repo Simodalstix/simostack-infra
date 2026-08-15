@@ -4,7 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Bench listing-extraction Lambda. Calls Claude via Bedrock (IAM auth, no Anthropic API key) using the official AWS SDK.",
+  "scripts": {
+    "test": "vitest run"
+  },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.712.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
   }
 }
