@@ -48,6 +48,41 @@ Plus an email-only budget at `EarlyWarningBudgetUsd` (default $1) that stops
 nothing and exists so the first news of creeping spend is not a breaker
 tripping.
 
+### Why the numbers are $10 and $1
+
+`EarlyWarningBudgetUsd = 1`. Measured Bedrock spend on this account is $0.00,
+so $1 is a clean anomaly signal rather than a threshold with a margin in it.
+Being wrong costs one email.
+
+`BudgetMonthlyLimitUsd = 10`, not 5:
+
+- Expected worst-case personal usage came out around $3.25/month. Against $5
+  that is only about 35% headroom, and it sits on top of a per-token rate that
+  was estimated, not verified. Retries, or listing text longer than the 4k-token
+  sample the estimate was built from, eat that headroom.
+- The two failure directions are not symmetric. Overshooting costs a few dollars
+  and is already bounded from below by faster layers: the kill switch caps any
+  single incident at roughly $0.65, and `ReservedConcurrentExecutions: 1` caps
+  the burn rate. Undershooting fires the explicit `Deny` on the execution role,
+  so real users get `AccessDenied` and the first notice of it is somebody
+  mentioning the site is broken.
+- $10 is still roughly 1,500x measured spend. It has not stopped being a smoke
+  alarm.
+
+Two bounds on what this number can actually do, both worth knowing before
+leaning on it:
+
+- **It is the slow-leak detector, not the fast breaker.** It runs on Cost
+  Explorer data and lags 6-24 hours, so it cannot catch a runaway loop inside
+  the window that matters. Layers 1-3 above are what bound a fast incident;
+  this layer bounds a slow one.
+- **It is account-wide for Bedrock, not scoped to this function.** The
+  `CostFilters` on the budget select the Amazon Bedrock service, not this
+  Lambda, because per-function attribution is not available at that granularity.
+  So any second Bedrock workload on this account shares the same $10 and will
+  drag the breaker toward tripping on spend this function never caused. Adding
+  one is the trigger to revisit the number, and probably to split the budget.
+
 ## First deploy
 
 Requires the [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
@@ -171,13 +206,30 @@ and nothing will tell you if you skip it.
   Note that the script only checks the local `.env`. A stale GitHub Actions
   secret is invisible to it and to every local test, and shows up only as a
   broken deployed site, so update the secret in the same sitting.
-- **Confirm every `AlertEmail` subscription.** The two budgets and the SNS
-  alarm topic each send their own confirmation link, and each is silent until
-  clicked. Check they show `Confirmed`; do not assume.
+- **Confirm the SNS alarm subscription, and do it within three days.** This is
+  the one alerting path with a confirmation handshake, and it is the one that
+  silently rots. The two budgets use Budgets' own EMAIL subscribers, which have
+  no confirmation step and start working immediately. The SNS topic does not:
+  CloudFormation creates the email subscription in `PendingConfirmation`, AWS
+  emails a link, and **an unconfirmed subscription is deleted after about three
+  days**. When that happens it does not show up as `PendingConfirmation`, it
+  disappears entirely, so a later check finds a topic with no email on it and
+  nothing anywhere saying there used to be one.
+
+  ```bash
+  aws sns get-topic-attributes --region ap-southeast-2 \
+    --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+    --query 'Attributes.{Confirmed:SubscriptionsConfirmed,Pending:SubscriptionsPending}'
+  ```
+
+  Expect two confirmed subscriptions: the `bench-extract-kill-switch` Lambda
+  and the email. The Lambda one confirms itself, so a count of 1 means the
+  email is gone and the kill switch will fire without telling anyone. The fix
+  is a redeploy to recreate the pending subscription, then clicking the link.
+  Verified missing on 2026-08-17 for exactly this reason, nine days after the
+  topic was created on 2026-08-08.
 - Confirm `Cors.AllowOrigins` in `template.yaml` matches the real deployed
   domains (currently `simostack.com` / `www.simostack.com`).
-- Pick real values for `BudgetMonthlyLimitUsd` and `EarlyWarningBudgetUsd`. The
-  defaults (5 and 1) are placeholders.
 
 ## Access token
 
@@ -228,14 +280,95 @@ Otherwise: `sam build && sam deploy`.
 Neither circuit breaker self-heals, on purpose. If one fired, something was
 wrong and it should be understood before the endpoint is live again.
 
-After the kill switch fired:
+Work out **which** one fired before touching anything. They present differently:
+
+- **Kill switch:** requests to the Function URL are throttled outright. Reserved
+  concurrency reads 0.
+- **Budget action:** the Function URL still answers, the handler still runs, and
+  only the Bedrock call fails, with `AccessDenied` on `bedrock:InvokeModel`. This
+  reads like a Bedrock outage or a broken IAM change rather than a breaker doing
+  its job, which is why the procedure below exists.
+
+### After the kill switch fired
 
 ```bash
 aws lambda put-function-concurrency \
   --function-name bench-extract --reserved-concurrent-executions 1
 ```
 
-After the budget action fired: Budgets → Actions → Revert, in the console.
+### After the budget action fired
+
+The deny is a managed policy (`BenchDenyBedrockPolicy`) that AWS Budgets
+attaches to the function's execution role. A `Deny` beats the role's own
+`Allow`, so nothing else about the function changes. Do not fix this by editing
+IAM by hand: reverse the action, so Budgets' own record of state matches
+reality and the action returns to `STANDBY` armed for next time.
+
+Physical names carry a stack-generated suffix and change if the stack is ever
+replaced, so discover them rather than pasting them. As of 2026-08-17 they are
+role `sam-app-BenchExtractFunctionRole-JkOIOYE75BYa` and policy
+`sam-app-BenchDenyBedrockPolicy-7gDgd1m8I3VO`.
+
+1. **Confirm it is really the budget action**, not a hand-made IAM mistake. A
+   status of `EXECUTION_SUCCESS` means it fired; `STANDBY` means it did not and
+   the `AccessDenied` is coming from somewhere else.
+
+   ```bash
+   ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+   aws budgets describe-budget-actions-for-budget \
+     --account-id "$ACCOUNT_ID" --budget-name bench-bedrock-monthly \
+     --query 'Actions[].{Id:ActionId,Status:Status}'
+   ```
+
+2. **Confirm the policy is actually attached**, which is the same fact seen from
+   the IAM side:
+
+   ```bash
+   ROLE=$(aws cloudformation describe-stack-resources \
+     --region ap-southeast-2 --stack-name sam-app \
+     --logical-resource-id BenchExtractFunctionRole \
+     --query 'StackResources[0].PhysicalResourceId' --output text)
+   aws iam list-attached-role-policies --role-name "$ROLE"
+   ```
+
+3. **Find out what spent the money before reverting.** This layer only trips on
+   real dollars, so something did. Reverting first and investigating later means
+   reopening the tap on a cause you do not understand yet.
+
+   ```bash
+   aws ce get-cost-and-usage --granularity MONTHLY \
+     --time-period Start=$(date -u +%Y-%m-01),End=$(date -u -d '+1 month' +%Y-%m-01) \
+     --metrics UnblendedCost --group-by Type=DIMENSION,Key=SERVICE \
+     --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Bedrock"]}}'
+   ```
+
+   Cross-check against the function's own logs for the same window, since the
+   budget is account-wide and the spend may not be this function's at all.
+
+4. **Decide the limit before reversing, not after.** If actual spend is still
+   above `BudgetMonthlyLimitUsd`, the action re-fires on the next evaluation and
+   you get the same `AccessDenied` back within hours. So either raise
+   `BudgetMonthlyLimitUsd` and deploy first, or accept that Bedrock stays denied
+   until the calendar month rolls over and the budget resets.
+
+5. **Reverse the action.**
+
+   ```bash
+   aws budgets execute-budget-action \
+     --account-id "$ACCOUNT_ID" --budget-name bench-bedrock-monthly \
+     --action-id <action-id-from-step-1> \
+     --execution-type REVERSE_BUDGET_ACTION
+   ```
+
+   Console equivalent: Billing → Budgets → `bench-bedrock-monthly` → Actions →
+   Revert. Note that `aws budgets` is a global endpoint, so these calls need no
+   `--region`, unlike every other command in this file.
+
+6. **Verify both sides came back.** Re-run steps 1 and 2: status should return to
+   `STANDBY` and `list-attached-role-policies` should no longer list
+   `BenchDenyBedrockPolicy`. Then exercise the real path once through the site's
+   add-listing flow, because a successful reverse still leaves a cold IAM cache
+   for a short window and the first call afterwards can still fail.
 
 ## Not yet done
 
@@ -243,4 +376,14 @@ After the budget action fired: Budgets → Actions → Revert, in the console.
   one deliberate test after deploy (temporarily drop the alarm threshold, or
   invoke `bench-extract-kill-switch` directly) to confirm it can actually set
   concurrency to 0, then restore concurrency to 1.
+- **The SNS email subscription on the alarm topic is currently missing** (checked
+  2026-08-17: one confirmed subscriber, the kill-switch Lambda). It expired
+  unconfirmed. Until a redeploy recreates it and the link is clicked, the kill
+  switch will fire silently. The budget emails are unaffected.
+- The budget-action reverse procedure above is written but, like the kill switch,
+  has never been run. It is derived from the template and the Budgets API, not
+  from an observed trip.
+- `BudgetMonthlyLimitUsd` is account-wide for Bedrock rather than scoped to this
+  function. A second Bedrock workload on this account is the trigger to revisit
+  the number and probably split the budget.
 - Log retention and alerting for extraction failures are not set up.

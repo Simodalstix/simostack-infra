@@ -7,7 +7,8 @@ design.
 ## Structure
 - `bench-extract/` — Bedrock-backed Lambda (listing extraction), SAM app. Built
   and deployed.
-- `bench-auth/` — Cognito auth for Bench. README only, nothing built (see below).
+- `bench-auth/` — Cognito auth for Bench. Phase 1 template authored, **nothing
+  deployed and no AWS resources created** (see below).
 - `SECURITY.md` — repo-wide threat model and guardrail rationale.
 - `README.md` — repo overview, deploy model, cross-repo handoff.
 - `.github/workflows/` — one test workflow per service.
@@ -73,9 +74,16 @@ service lockfile (the cache step resolves that from the repo root regardless of
 
 **A new service gets a new workflow file**, not another branch inside this one —
 a repo-wide test job would have to know every service directory or force a root
-workspace. `bench-auth` will need `.github/workflows/bench-auth-tests.yml`.
+workspace.
 
-## Deployed state (verified 2026-08-16)
+`.github/workflows/bench-auth-tests.yml` — same shape, path-filtered to
+`bench-auth/**`, but it lints CloudFormation instead of running unit tests.
+bench-auth is IaC only with no JavaScript, so there is no `package.json` and
+nothing for vitest to run; `cfn-lint` is the equivalent check. If bench-auth
+ever grows Lambda code (a pre-sign-up trigger, say), add a `npm test` step
+rather than replacing the lint one.
+
+## Deployed state (verified 2026-08-17)
 
 - The bench-extract stack is deployed in **`ap-southeast-2` under the stack name
   `sam-app`** — the `--guided` default, never changed. There is no stack named
@@ -83,9 +91,19 @@ workspace. `bench-auth` will need `.github/workflows/bench-auth-tests.yml`.
   easy mistake. The Lambda itself is `bench-extract`.
 - Reserved concurrency is 1, matching the template. `bench-extract-high-invocations`
   (logical ID `BenchHighInvocationAlarm`) is in `OK`.
-- Budget parameters are still the placeholder defaults (`BudgetMonthlyLimitUsd=5`,
-  `EarlyWarningBudgetUsd=1`) that `bench-extract/README.md` says to replace with
-  real values.
+- Budget parameters are now deliberate values, not placeholders:
+  `BudgetMonthlyLimitUsd=10` and `EarlyWarningBudgetUsd=1`, justified in
+  `bench-extract/README.md` under "Why the numbers are $10 and $1". **The live
+  stack still runs the old `5`**, because the change landed in `template.yaml`
+  and the gitignored `samconfig.toml` and takes effect on the next deploy.
+- **The SNS email subscription on `bench-extract-invocation-alarm` is missing.**
+  The topic has exactly one confirmed subscriber, the kill-switch Lambda. The
+  email subscription the template declares was created `PendingConfirmation` on
+  2026-08-08, was never confirmed, and SNS deleted it after about three days. It
+  reads as absent rather than pending, so a naive check sees a healthy topic. The
+  kill switch therefore fires silently today. Budget notifications are unaffected:
+  Budgets' EMAIL subscribers have no confirmation handshake. A redeploy plus one
+  click on the link fixes it.
 - **The AWS CLI and SAM CLI are installed here and credentials are live and
   admin-level.** `sam validate --lint` passes against `template.yaml`, and
   read-only `aws` calls work. This means a deploy is *possible* from this
@@ -115,35 +133,81 @@ set as GitHub Actions secrets on `vue-simostack` and in its local `.env`
 error — the site calls the old one and every extraction fails as a network error
 that reads like a Lambda fault.
 
-## bench-auth (next up, not started)
+## bench-auth (Phase 1 authored, nothing deployed)
 
-Cognito User Pool + Google as federated IdP, self-service sign-up (no manual
-approval). Use a Cognito **Identity Pool**, not a User Pool alone, so
-authorization is enforced via IAM role + condition keys rather than application
-code — that is the actual point of this piece, not just adding a login screen.
+Replaces the shared `x-bench-token` header — checked in
+`bench-extract/index.mjs` (~line 153) against an SSM-sourced env var — with
+Cognito. That token ships in the public JS bundle and was never a secret.
 
-Before writing any of it, work through the design checklist in `SECURITY.md`.
+Work through the design checklist in `SECURITY.md` before extending any of this.
 
-What it replaces: the shared `x-bench-token` header, checked in
-`bench-extract/index.mjs` (~line 153) against an SSM-sourced env var. That token
-ships in the public JS bundle and was never a secret; what actually bounds abuse
-is the Bedrock quota, reserved concurrency, the kill switch and the budget
-action.
+### The load-bearing constraint
 
-Two things to get right, both easy to get subtly wrong:
+**The Lambda stays the only thing that calls Bedrock.** The authenticated
+Identity Pool role gets `lambda:InvokeFunctionUrl` on the one function ARN and
+nothing else. It must never get `bedrock:InvokeModel`.
 
-1. **The budget circuit breaker does not automatically cover a new role.** The
-   Budgets-triggered deny (`BenchDenyBedrockPolicy`, `Resource: '*'` on
-   `bedrock:InvokeModel`) is attached by `BenchBudgetAction` to exactly one role
-   — the `Roles:` list names only `BenchExtractFunctionRole`. So:
-   - If Bench users keep reaching Bedrock *only through the Lambda*, the
-     existing deny still covers all spend, and the authenticated role needs
-     nothing more than `lambda:InvokeFunctionUrl`. This is the simpler design.
-   - If the authenticated role is ever granted direct Bedrock access, it must be
-     added to that `Roles:` list, or the enforcement budget has a hole. The
-     account-wide budget would still *notice* the spend; it just wouldn't stop it.
-2. **Switching the Function URL off `AuthType: NONE`** to `AWS_IAM` touches more
-   than one file: the `Cors` block still allowlists the `x-bench-token` header,
-   the handler's token check has to go or become conditional, and the frontend
-   call has to start signing SigV4. Landing this changes `bench-extract`,
-   `bench-auth` and `vue-simostack` together.
+This is not a style preference — three of the four spend layers are properties
+of the Lambda or its role, and handing browsers Bedrock credentials silently
+removes all three:
+
+| Layer | Mechanism | Survives direct-to-Bedrock? |
+| --- | --- | --- |
+| Bedrock service quota | Account-level, synchronous | Yes |
+| `ReservedConcurrentExecutions` | Lambda config | **No** |
+| Alarm → SNS → kill switch | Zeroes *that Lambda's* concurrency | **No** |
+| Budget → deny policy | Attached to `BenchExtractFunctionRole` | **No** |
+
+`BenchDenyBedrockPolicy` is attached by `BenchBudgetAction` to exactly one role
+— its `Roles:` list names only `BenchExtractFunctionRole`. Route spend around
+that role and the enforcement budget still *notices* it but no longer *stops*
+it. So if a future change ever does grant a second principal direct Bedrock
+access, that principal must be added to the `Roles:` list in the same change.
+
+If you are about to propose issuing Bedrock credentials to the browser: that was
+considered and rejected for the reason above. Don't re-derive it.
+
+### Settled decisions
+
+- Open self-service sign-up via Google federation. No approval gate, no
+  pre-sign-up allowlist trigger.
+- Authorization via Identity Pool + IAM role, not application-layer logic. This
+  is the point of the project, not just adding a login screen.
+- Global caps only, no per-user spend limits in the Lambda. Expected scale is
+  under 5 users; 10 is the revisit point.
+- Function URL moves `AuthType: NONE` → `AWS_IAM`. Hard cutover, no alias or
+  dual-URL transition — the breakage window is acceptable at this scale.
+- `ReservedConcurrentExecutions` goes 1 → 2, because a second concurrent user
+  currently gets a 429. The >100-invocations/5min alarm threshold stays where it
+  is: with no per-user quota, that global breaker is the only fast defence.
+- Log the Cognito sub on every invocation even though per-user quotas are
+  deferred. It costs nothing, it tells you *who* when the alarm fires, and it
+  means quotas can be added later without a second cutover.
+
+**Consequence of open sign-up + global caps:** anyone with a Google account can
+sign up and spend the Bedrock budget. That is accepted — but it makes
+`BudgetMonthlyLimitUsd` the actual security boundary rather than a placeholder.
+
+### Phases
+
+1. **bench-auth standalone** — User Pool, Google IdP, User Pool client, Identity
+   Pool, authenticated role. Deploys and verifies without touching
+   bench-extract. *Authored, not deployed.*
+2. **bench-extract cutover** — `AuthType: AWS_IAM`; drop the token check;
+   `Cors.AllowHeaders` loses `x-bench-token` and gains the SigV4 headers; read
+   identity from `requestContext.authorizer.iam.cognitoIdentity`; concurrency to
+   2. A Function URL cannot serve both auth modes at once, so there is a
+   breakage window between this and Phase 3.
+3. **vue-simostack** — login UI, SigV4 signing on the call, retire
+   `VITE_BENCH_ACCESS_TOKEN`.
+4. **Recalibrate and update `SECURITY.md`** — "the shared token is not
+   authentication" closes; "open sign-up means anyone can spend the budget"
+   opens in its place.
+
+### Untested infrastructure
+
+The alarm → SNS → kill-switch chain has never fired. `SECURITY.md` claims it
+works. Before opening sign-up, invoke `bench-extract-kill-switch` directly (not
+by lowering the alarm threshold), confirm reserved concurrency hits 0 and an
+invocation throttles, then restore it. This is a live-resource change — ask
+first.

@@ -1,0 +1,48 @@
+name: bench-auth checks
+
+# Per-service workflow, named for the service it covers, same as
+# bench-extract-tests.yml. A second service gets a second file rather than
+# another branch inside an existing one.
+#
+# This one lints CloudFormation rather than running unit tests: bench-auth is
+# IaC only, with no JavaScript, so there is no package.json and nothing for
+# vitest to run. cfn-lint is the equivalent check -- it catches bad property
+# names, wrong intrinsic-function usage and invalid resource types, which is
+# the class of mistake that otherwise only shows up mid-deploy. The job name is
+# "checks" rather than "tests" for that reason; the filename keeps the sibling's
+# convention. If bench-auth ever grows Lambda code (a pre-sign-up trigger, say),
+# add an npm test step alongside this rather than replacing it.
+on:
+  push:
+    paths:
+      - 'bench-auth/**'
+      - '.github/workflows/bench-auth-tests.yml'
+  pull_request:
+    paths:
+      - 'bench-auth/**'
+      - '.github/workflows/bench-auth-tests.yml'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: bench-auth
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # pipx rather than `pip install`: it is preinstalled on the runner image
+      # and installs into its own environment, so this does not trip the
+      # PEP 668 externally-managed-environment error that a plain `pip install`
+      # hits on current Ubuntu images. No setup-python step, deliberately --
+      # the runner's own Python is fine for a linter and pinning a version here
+      # would be one more thing to keep current.
+      - run: pipx install cfn-lint
+
+      # No AWS credentials and no network calls. cfn-lint is static analysis
+      # against the resource-provider schemas it ships with, so this stays a
+      # pure offline check -- it validates the template, it does not confirm
+      # the stack would deploy.
+      - run: cfn-lint template.yaml
