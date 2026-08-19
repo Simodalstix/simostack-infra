@@ -102,8 +102,11 @@ rather than replacing the lint one.
   2026-08-08, was never confirmed, and SNS deleted it after about three days. It
   reads as absent rather than pending, so a naive check sees a healthy topic. The
   kill switch therefore fires silently today. Budget notifications are unaffected:
-  Budgets' EMAIL subscribers have no confirmation handshake. A redeploy plus one
-  click on the link fixes it.
+  Budgets' EMAIL subscribers have no confirmation handshake. **A redeploy does
+  not fix it**: the subscription is inline on the topic, `AlertEmail` is
+  unchanged, so CloudFormation puts the topic in no changeset. Drift detection
+  reports it `MODIFIED` / `/Subscription/0` `REMOVE`d and does not remediate.
+  Re-subscribe with `aws sns subscribe`, then click the link within three days.
 - **The AWS CLI and SAM CLI are installed here and credentials are live and
   admin-level.** `sam validate --lint` passes against `template.yaml`, and
   read-only `aws` calls work. This means a deploy is *possible* from this

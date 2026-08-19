@@ -256,9 +256,26 @@ and nothing will tell you if you skip it.
   as a healthy topic, because the kill-switch Lambda subscribes itself and needs
   no confirmation. The count is never 0 and never says anything about the email.
 
-  The fix is a redeploy to recreate the pending subscription, then clicking the
-  link. Verified missing on 2026-08-17 for exactly this reason, nine days after
-  the topic was created on 2026-08-08.
+  **A redeploy does not fix this.** The subscription is declared inline on
+  `BenchInvocationAlarmTopic`, so recreating it needs CloudFormation to update
+  that topic, and CloudFormation only updates resources whose declared
+  properties changed. `AlertEmail` has not changed, so the topic is absent from
+  the changeset and the deploy leaves the gap exactly as it found it.
+  CloudFormation can see the gap and still will not close it: drift detection
+  reports the topic `MODIFIED` with `/Subscription/0` `REMOVE`d, and drift is
+  never remediated on update.
+
+  Re-subscribe directly instead, then click the link within three days:
+
+  ```bash
+  aws sns subscribe --region ap-southeast-2 \
+    --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+    --protocol email --notification-endpoint <AlertEmail>
+  ```
+
+  This moves the live topic back to what the template already declares, so it
+  clears the drift rather than adding more. Verified missing on 2026-08-17 for
+  exactly this reason, nine days after the topic was created on 2026-08-08.
 - Confirm `Cors.AllowOrigins` in `template.yaml` matches the real deployed
   domains (currently `simostack.com` / `www.simostack.com`).
 
@@ -459,7 +476,7 @@ Two things this deliberately is not:
   before it trips.
 
 To exercise the topic and below without involving the alarm, which is the useful
-check straight after a redeploy has recreated the email subscription:
+check straight after re-subscribing the email endpoint:
 
 ```bash
 aws sns publish --region ap-southeast-2 \
@@ -505,8 +522,9 @@ fires at the right time".
   email subscription is confirmed.
 - **The SNS email subscription on the alarm topic is currently missing** (checked
   2026-08-17: one confirmed subscriber, the kill-switch Lambda). It expired
-  unconfirmed. Until a redeploy recreates it and the link is clicked, the kill
-  switch will fire silently. The budget emails are unaffected.
+  unconfirmed. Until it is re-created with `aws sns subscribe` and the link is
+  clicked, the kill switch will fire silently. A redeploy will not do it; see
+  "After deploy". The budget emails are unaffected.
 - The budget-action reverse procedure above is written but, like the kill switch,
   has never been run. It is derived from the template and the Budgets API, not
   from an observed trip.
