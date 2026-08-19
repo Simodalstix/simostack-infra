@@ -119,8 +119,8 @@ code executes. That is why the kill switch uses it.
 ### Budgets lag; CloudWatch does not
 
 **AWS Budgets runs on Cost Explorer data and can lag 6-24 hours.** A
-`BudgetsAction` that denies at $5 may not fire until long after $5 is spent. It
-is a real cap on the _month_ and useless against a loop that starts at 11pm.
+`BudgetsAction` that denies at $10 may not fire until long after $10 is spent.
+It is a real cap on the _month_ and useless against a loop that starts at 11pm.
 
 So pair it with a CloudWatch alarm on the function's own `Invocations` metric,
 landing in about a minute, wired through SNS to a Lambda that calls
@@ -144,7 +144,7 @@ is one command, so err fast.
 A budget that both warns and enforces has to sit at the pain threshold, which
 means the first news of creeping spend is the circuit breaker tripping. Split
 them: a **low budget (~$1), email only, no action**, including a FORECASTED
-notification for the earliest possible signal, and a **high budget ($5) with
+notification for the earliest possible signal, and a **high budget ($10) with
 the deny action** as the actual cap. The low one exists to make you look while
 the number is still interesting rather than alarming.
 
