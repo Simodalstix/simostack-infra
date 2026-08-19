@@ -37,8 +37,8 @@ execution role:
 | Alarm → SNS → kill switch      | Zeroes *that Lambda's* concurrency         | **No**                      |
 | Budget → deny policy           | Attached to `BenchExtractFunctionRole`     | **No**                      |
 
-`BenchDenyBedrockPolicy` is attached by `BenchBudgetAction` to exactly one role
-— its `Roles:` list names only `BenchExtractFunctionRole`. Issuing Bedrock
+`BenchDenyBedrockPolicy` is attached by `BenchBudgetAction` to exactly one role:
+its `Roles:` list names only `BenchExtractFunctionRole`. Issuing Bedrock
 credentials to the browser routes spend around all three layers and leaves the
 enforcement budget attached to a role nobody is using. It would look like it
 still worked, right up until it needed to work.
@@ -56,7 +56,7 @@ do not need re-deriving.
   pre-sign-up allowlist trigger.
 - **Authorization via Identity Pool + IAM role**, not application-layer logic.
   This is the point of the project, not just adding a login screen.
-- **Global caps only** — no per-user spend limits in the Lambda. Expected scale
+- **Global caps only**: no per-user spend limits in the Lambda. Expected scale
   is under 5 users; 10 is the point to revisit.
 - **Function URL moves `AuthType: NONE` → `AWS_IAM`** in Phase 2. Hard cutover,
   no alias or dual-URL transition; the breakage window is acceptable here.
@@ -75,16 +75,16 @@ boundary rather than a placeholder.
 
 ## Phases
 
-1. **bench-auth standalone** — everything in this directory. Deploys and
+1. **bench-auth standalone**: everything in this directory. Deploys and
    verifies without touching bench-extract. *Authored, not deployed.*
-2. **bench-extract cutover** — `AuthType: AWS_IAM`, drop the token check,
+2. **bench-extract cutover**: `AuthType: AWS_IAM`, drop the token check,
    `Cors.AllowHeaders` loses `x-bench-token` and gains the SigV4 headers, read
    identity from `requestContext.authorizer.iam.cognitoIdentity`, concurrency to
    2. A Function URL cannot serve both auth modes at once, so there is a
    breakage window between this and Phase 3.
-3. **vue-simostack** — login UI, SigV4 signing on the call, retire
+3. **vue-simostack**: login UI, SigV4 signing on the call, retire
    `VITE_BENCH_ACCESS_TOKEN`.
-4. **Recalibrate and update `SECURITY.md`** — "the shared token is not
+4. **Recalibrate and update `SECURITY.md`**: "the shared token is not
    authentication" closes as a gap; "open sign-up means anyone can spend the
    budget" opens in its place.
 
@@ -108,7 +108,7 @@ https://<CognitoDomainPrefix>.auth.ap-southeast-2.amazoncognito.com/oauth2/idpre
 
 Pick the prefix first, use it in step 5 below, then pass the same value as
 `CognitoDomainPrefix` at deploy time. It must be globally unique across all AWS
-accounts, so choose something specific — `bench-simostack`, not `bench`. The
+accounts, so choose something specific: `bench-simostack`, not `bench`. The
 stack outputs `GoogleRedirectUri` so you can confirm the two agree after
 deploying.
 
@@ -118,7 +118,7 @@ deploying.
    <https://console.cloud.google.com/>. A dedicated project is easier to reason
    about later than reusing an unrelated one.
 2. **Configure the OAuth consent screen** (APIs & Services → OAuth consent
-   screen). User type **External** — this is what allows any Google account to
+   screen). User type **External**, which is what allows any Google account to
    sign up, which is the open self-service decision above. Internal would
    restrict it to a Workspace org.
 3. **Fill in the consent screen fields**: app name, user support email, developer
@@ -129,7 +129,7 @@ deploying.
    scope later would trigger one, which takes days.
 5. **Publish the app.** This is the step that is easy to miss and the failure is
    confusing. While the consent screen is in **Testing**, only Google accounts
-   explicitly added as test users can sign in, capped at 100 — everyone else
+   explicitly added as test users can sign in, capped at 100. Everyone else
    gets `Error 403: access_denied` with no useful explanation. Open
    self-service sign-up requires status **In production**.
 6. **Create credentials** (APIs & Services → Credentials → Create credentials →
@@ -139,12 +139,12 @@ deploying.
    https://<CognitoDomainPrefix>.auth.ap-southeast-2.amazoncognito.com
    ```
 8. **Authorized redirect URIs**: the same origin plus `/oauth2/idpresponse`.
-   This must match exactly — no trailing slash.
+   This must match exactly, with no trailing slash.
    ```
    https://<CognitoDomainPrefix>.auth.ap-southeast-2.amazoncognito.com/oauth2/idpresponse
    ```
 9. **Copy the client ID and client secret.** The ID is not sensitive; it appears
-   in the sign-in redirect. The secret is a genuine secret — unlike the
+   in the sign-in redirect. The secret is a genuine secret. Unlike the
    bench-extract access token, this one is never published anywhere and should
    be treated accordingly.
 
@@ -165,7 +165,7 @@ plain CloudFormation with no code to package, so the template has no
 
 Answer `Y` to **`Allow SAM CLI IAM role creation`**: the template declares
 `AWS::IAM::Role` for the authenticated role. `CAPABILITY_IAM` is sufficient
-because the role has no custom `RoleName` — the same reasoning as the
+because the role has no custom `RoleName`, the same reasoning as the
 bench-extract README's note. Adding a `RoleName` later would start requiring
 `CAPABILITY_NAMED_IAM`, with an error that does not explain why.
 
@@ -181,7 +181,7 @@ and resolved by CloudFormation so it is never typed at a prompt. That pattern
 does not transfer directly: `AWS::SSM::Parameter::Value<String>` cannot read a
 `SecureString`, and `{{resolve:ssm-secure}}` is restricted to an allowlist of
 resource properties. Whether `AWS::Cognito::UserPoolIdentityProvider`'s
-`ProviderDetails` is on that allowlist has **not been verified** — if it is,
+`ProviderDetails` is on that allowlist has **not been verified**. If it is,
 moving the secret to a SecureString is a strict improvement and worth doing
 before this goes to production.
 
@@ -192,7 +192,7 @@ before this goes to production.
 - Sign in once through the hosted UI to confirm a user is created in the pool
   and that the Identity Pool issues credentials.
 - Confirm the credentials can invoke the bench-extract Function URL and **cannot**
-  call Bedrock directly. The second half is the one worth actually testing — an
+  call Bedrock directly. The second half is the one worth actually testing: an
   `aws bedrock invoke-model` with those credentials should return `AccessDenied`.
 - The `UserPoolClientId`, `IdentityPoolId` and `HostedUiDomain` outputs are what
   Phase 3 needs in `vue-simostack`. Nothing carries them across automatically,
@@ -206,7 +206,7 @@ before this goes to production.
 - The Google Cloud Console prerequisites above have not been carried out.
 - `cfn-lint` and `sam validate --lint` pass, which is static validation only.
   The stack has never been deployed, so nothing confirms the resources actually
-  create — Cognito's cross-resource validation (IdP names, callback URL formats,
+  create. Cognito's cross-resource validation (IdP names, callback URL formats,
   domain-prefix uniqueness) mostly fails at deploy time, not lint time.
 - Whether the Google client secret can live in SSM as a `SecureString` is
   unverified. See above.

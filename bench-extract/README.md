@@ -145,8 +145,8 @@ review. Do them first, per account and per region.
   The `models[].modelArn` values it returns are exactly the foundation-model
   ARNs the IAM policy grants; if that list ever changes, the policy needs the
   same edit. `BedrockRegion` must stay inside the profile's geography
-  (`ap-southeast-2` or `ap-southeast-4`) — unlike a bare foundation-model ID,
-  it can't be repointed at `us-east-1` to chase availability.
+  (`ap-southeast-2` or `ap-southeast-4`). Unlike a bare foundation-model ID, it
+  can't be repointed at `us-east-1` to chase availability.
 - **Lower the Bedrock on-demand rate quota** to roughly 1-2x realistic personal
   usage. Do this early, not during an incident: the Service Quotas console form
   is built for _increases_, and a decrease generally needs a support case.

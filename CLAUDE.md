@@ -1,36 +1,36 @@
 # simostack-infra
 
 Backend AWS infra for simostack.com, deployed independently of the frontend
-(vue-simostack) — separate CI, separate deploy lifecycle, separate repo by
+(vue-simostack): separate CI, separate deploy lifecycle, separate repo by
 design.
 
 ## Structure
-- `bench-extract/` — Bedrock-backed Lambda (listing extraction), SAM app. Built
+- `bench-extract/`: Bedrock-backed Lambda (listing extraction), SAM app. Built
   and deployed.
-- `bench-auth/` — Cognito auth for Bench. Phase 1 template authored, **nothing
+- `bench-auth/`: Cognito auth for Bench. Phase 1 template authored, **nothing
   deployed and no AWS resources created** (see below).
-- `SECURITY.md` — repo-wide threat model and guardrail rationale.
-- `README.md` — repo overview, deploy model, cross-repo handoff.
-- `.github/workflows/` — one test workflow per service.
+- `SECURITY.md`: repo-wide threat model and guardrail rationale.
+- `README.md`: repo overview, deploy model, cross-repo handoff.
+- `.github/workflows/`: one test workflow per service.
 
 ## Where the documentation lives
 
 The READMEs are the source of truth and are detailed. Read rather than infer:
 
-- `SECURITY.md` — why each guardrail exists, and the **design checklist for a
+- `SECURITY.md`: why each guardrail exists, and the **design checklist for a
   new public Bedrock endpoint**. It applies to every service here, `bench-auth`
   included, not just bench-extract. Read before writing a public endpoint or
   loosening a guardrail.
-- `bench-extract/README.md` — the procedure: account prerequisites, first
+- `bench-extract/README.md` is the procedure: account prerequisites, first
   deploy, token rotation, incident recovery.
-- `bench-auth/README.md` — what the service is meant to replace.
+- `bench-auth/README.md`: what the service is meant to replace.
 
 ## Conventions
 
 - **Per-service, not workspace-hoisted.** Each service has its own
   `package.json`, lockfile, `node_modules` and vitest config. `sam build` copies
-  a service directory expecting deps to resolve from inside it — don't hoist to
-  root, and don't add a root workspace.
+  a service directory expecting deps to resolve from inside it, so don't hoist
+  to root, and don't add a root workspace.
 - **Deploy is manual**, from within each service dir: `sam build && sam deploy`,
   with `--guided` on first deploy. No CI deploys anything; CI only runs tests.
 - **No root-level stack** tying services together, deliberately.
@@ -38,7 +38,7 @@ The READMEs are the source of truth and are detailed. Read rather than infer:
   depth (`**/samconfig.toml`), so a new service directory is covered the day it
   is created. `samconfig.toml` holds stack name, region, capabilities and
   `parameter_overrides` (budget caps, alert email, model IDs, and the SSM
-  parameter *name*) — never the access token itself, which CloudFormation
+  parameter *name*), never the access token itself, which CloudFormation
   resolves from SSM at deploy time. Don't re-run `--guided` casually; its
   prompts overwrite real values with defaults.
 
@@ -56,7 +56,7 @@ Two things in `bench-extract/vitest.config.js` that are load-bearing:
   `__tests__/stubs/bedrock-runtime.js`. Tests need no network and no AWS
   credentials, and no test should make a real Bedrock call.
 - `**/.aws-sam/**` is excluded from discovery. `sam build` copies `__tests__`
-  into `.aws-sam/build/`, so without the exclude vitest runs every test twice —
+  into `.aws-sam/build/`, so without the exclude vitest runs every test twice,
   the second time against a stale gitignored snapshot. Spread
   `configDefaults.exclude`; replacing it silently re-enables `node_modules`.
 
@@ -66,17 +66,17 @@ version that serves it in production.
 
 ## CI
 
-`.github/workflows/bench-extract-tests.yml` — tests only, no deploy. It is
+`.github/workflows/bench-extract-tests.yml` runs tests only, no deploy. It is
 paths-filtered to `bench-extract/**` plus its own file, and sets
 `working-directory: bench-extract` with `cache-dependency-path` pointed at the
 service lockfile (the cache step resolves that from the repo root regardless of
 `working-directory`).
 
-**A new service gets a new workflow file**, not another branch inside this one —
+**A new service gets a new workflow file**, not another branch inside this one:
 a repo-wide test job would have to know every service directory or force a root
 workspace.
 
-`.github/workflows/bench-auth-tests.yml` — same shape, path-filtered to
+`.github/workflows/bench-auth-tests.yml` is the same shape, path-filtered to
 `bench-auth/**`, but it lints CloudFormation instead of running unit tests.
 bench-auth is IaC only with no JavaScript, so there is no `package.json` and
 nothing for vitest to run; `cfn-lint` is the equivalent check. If bench-auth
@@ -86,7 +86,7 @@ rather than replacing the lint one.
 ## Deployed state (verified 2026-08-17)
 
 - The bench-extract stack is deployed in **`ap-southeast-2` under the stack name
-  `sam-app`** — the `--guided` default, never changed. There is no stack named
+  `sam-app`**, the `--guided` default, never changed. There is no stack named
   `bench-extract`; looking for one and concluding nothing is deployed is the
   easy mistake. The Lambda itself is `bench-extract`.
 - Reserved concurrency is 1, matching the template. `bench-extract-high-invocations`
@@ -107,12 +107,12 @@ rather than replacing the lint one.
 - **The AWS CLI and SAM CLI are installed here and credentials are live and
   admin-level.** `sam validate --lint` passes against `template.yaml`, and
   read-only `aws` calls work. This means a deploy is *possible* from this
-  environment — do not run one unless asked. Note especially the README's
+  environment, so do not run one unless asked. Note especially the README's
   warning: never `sam deploy` your way out of a fired kill switch, since it
   silently resets concurrency and reopens the endpoint.
 - The real Bedrock path has been exercised in production (invocations logged
   2026-08-08/09, 1.3-2.7s, no Bedrock errors). The alarm → SNS → kill-switch
-  chain has **not** — the alarm has only ever gone `INSUFFICIENT_DATA` → `OK`.
+  chain has **not**: the alarm has only ever gone `INSUFFICIENT_DATA` → `OK`.
 
 ## History
 
@@ -130,13 +130,13 @@ until that file is updated.
 Also carried by hand across that boundary: the Function URL and access token,
 set as GitHub Actions secrets on `vue-simostack` and in its local `.env`
 (`VITE_BENCH_EXTRACT_URL`, `VITE_BENCH_ACCESS_TOKEN`). A stale URL doesn't
-error — the site calls the old one and every extraction fails as a network error
+error: the site calls the old one and every extraction fails as a network error
 that reads like a Lambda fault.
 
 ## bench-auth (Phase 1 authored, nothing deployed)
 
-Replaces the shared `x-bench-token` header — checked in
-`bench-extract/index.mjs` (~line 153) against an SSM-sourced env var — with
+Replaces the shared `x-bench-token` header (checked in
+`bench-extract/index.mjs`, ~line 153, against an SSM-sourced env var) with
 Cognito. That token ships in the public JS bundle and was never a secret.
 
 Work through the design checklist in `SECURITY.md` before extending any of this.
@@ -147,7 +147,7 @@ Work through the design checklist in `SECURITY.md` before extending any of this.
 Identity Pool role gets `lambda:InvokeFunctionUrl` on the one function ARN and
 nothing else. It must never get `bedrock:InvokeModel`.
 
-This is not a style preference — three of the four spend layers are properties
+This is not a style preference. Three of the four spend layers are properties
 of the Lambda or its role, and handing browsers Bedrock credentials silently
 removes all three:
 
@@ -158,8 +158,8 @@ removes all three:
 | Alarm → SNS → kill switch | Zeroes *that Lambda's* concurrency | **No** |
 | Budget → deny policy | Attached to `BenchExtractFunctionRole` | **No** |
 
-`BenchDenyBedrockPolicy` is attached by `BenchBudgetAction` to exactly one role
-— its `Roles:` list names only `BenchExtractFunctionRole`. Route spend around
+`BenchDenyBedrockPolicy` is attached by `BenchBudgetAction` to exactly one role:
+its `Roles:` list names only `BenchExtractFunctionRole`. Route spend around
 that role and the enforcement budget still *notices* it but no longer *stops*
 it. So if a future change ever does grant a second principal direct Bedrock
 access, that principal must be added to the `Roles:` list in the same change.
@@ -176,7 +176,7 @@ considered and rejected for the reason above. Don't re-derive it.
 - Global caps only, no per-user spend limits in the Lambda. Expected scale is
   under 5 users; 10 is the revisit point.
 - Function URL moves `AuthType: NONE` → `AWS_IAM`. Hard cutover, no alias or
-  dual-URL transition — the breakage window is acceptable at this scale.
+  dual-URL transition; the breakage window is acceptable at this scale.
 - `ReservedConcurrentExecutions` goes 1 → 2, because a second concurrent user
   currently gets a 429. The >100-invocations/5min alarm threshold stays where it
   is: with no per-user quota, that global breaker is the only fast defence.
@@ -185,22 +185,22 @@ considered and rejected for the reason above. Don't re-derive it.
   means quotas can be added later without a second cutover.
 
 **Consequence of open sign-up + global caps:** anyone with a Google account can
-sign up and spend the Bedrock budget. That is accepted — but it makes
+sign up and spend the Bedrock budget. That is accepted, but it makes
 `BudgetMonthlyLimitUsd` the actual security boundary rather than a placeholder.
 
 ### Phases
 
-1. **bench-auth standalone** — User Pool, Google IdP, User Pool client, Identity
+1. **bench-auth standalone**: User Pool, Google IdP, User Pool client, Identity
    Pool, authenticated role. Deploys and verifies without touching
    bench-extract. *Authored, not deployed.*
-2. **bench-extract cutover** — `AuthType: AWS_IAM`; drop the token check;
+2. **bench-extract cutover**: `AuthType: AWS_IAM`; drop the token check;
    `Cors.AllowHeaders` loses `x-bench-token` and gains the SigV4 headers; read
    identity from `requestContext.authorizer.iam.cognitoIdentity`; concurrency to
    2. A Function URL cannot serve both auth modes at once, so there is a
    breakage window between this and Phase 3.
-3. **vue-simostack** — login UI, SigV4 signing on the call, retire
+3. **vue-simostack**: login UI, SigV4 signing on the call, retire
    `VITE_BENCH_ACCESS_TOKEN`.
-4. **Recalibrate and update `SECURITY.md`** — "the shared token is not
+4. **Recalibrate and update `SECURITY.md`**: "the shared token is not
    authentication" closes; "open sign-up means anyone can spend the budget"
    opens in its place.
 
@@ -213,4 +213,4 @@ alarm with `aws cloudwatch set-alarm-state`, then check **both** halves, reserve
 concurrency at 0 and the email actually arriving. Do not invoke the kill-switch
 Lambda directly. It publishes nothing, so that tests the concurrency half and
 silently skips the notification half, which is the failure this drill exists to
-catch. This is a live-resource change — ask first.
+catch. This is a live-resource change, so ask first.
