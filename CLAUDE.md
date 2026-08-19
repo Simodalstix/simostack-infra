@@ -207,7 +207,10 @@ sign up and spend the Bedrock budget. That is accepted — but it makes
 ### Untested infrastructure
 
 The alarm → SNS → kill-switch chain has never fired. `SECURITY.md` claims it
-works. Before opening sign-up, invoke `bench-extract-kill-switch` directly (not
-by lowering the alarm threshold), confirm reserved concurrency hits 0 and an
-invocation throttles, then restore it. This is a live-resource change — ask
-first.
+works. Before opening sign-up, run the "Testing the kill switch" drill in
+`bench-extract/README.md`: confirm the topic has both subscribers, force the
+alarm with `aws cloudwatch set-alarm-state`, then check **both** halves, reserved
+concurrency at 0 and the email actually arriving. Do not invoke the kill-switch
+Lambda directly. It publishes nothing, so that tests the concurrency half and
+silently skips the notification half, which is the failure this drill exists to
+catch. This is a live-resource change — ask first.

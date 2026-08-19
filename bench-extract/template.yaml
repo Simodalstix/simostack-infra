@@ -390,7 +390,7 @@ Resources:
           )
         }
 
-  # Email-only early warning, separate from the $5 enforcement budget above.
+  # Email-only early warning, separate from the enforcement budget above.
   # A budget that both warns and enforces has to be set at the pain threshold,
   # which means the first thing you hear about creeping spend is the circuit
   # breaker. Splitting them lets the warning sit low and the cap sit high.

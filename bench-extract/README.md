@@ -48,6 +48,31 @@ Plus an email-only budget at `EarlyWarningBudgetUsd` (default $1) that stops
 nothing and exists so the first news of creeping spend is not a breaker
 tripping.
 
+### Layer 3's two halves fail independently
+
+Layer 3 does two things off one SNS topic, and they do not stand or fall
+together. Stopping the spend is the kill-switch Lambda, subscribed by
+CloudFormation, which confirms itself and stays subscribed. Telling you it
+happened is an email subscription on the same topic, which needs a human to
+click a link and is deleted if nobody does within about three days.
+
+So the expected failure is the notification half alone, and it is asymmetric in
+an unhelpful direction. Spend still stops: the alarm fires, the Lambda zeroes
+reserved concurrency, and nothing reaches Bedrock. What is lost is any account
+of why. The tool is simply down, every request throttles, and no message exists
+anywhere connecting that to a breaker. **Read a kill-switch trip as an outage
+that arrives with no explanation attached, not as an alert you might have
+missed.** Reserved concurrency at 0 on `bench-extract` is the only symptom, and
+you only see it if you already suspected it.
+
+The diagnostic surface hides this rather than surfacing it. The topic reports
+`SubscriptionsConfirmed: 1`, which looks like a healthy topic and is not: the
+one confirmed subscriber is the Lambda doing the killing, not the human being
+told about it. That count cannot distinguish "email confirmed" from "email
+deleted", so checking it is worse than not checking. "After deploy" below has
+the check that does work, and "Testing the kill switch" has the drill that
+exercises both halves rather than the easy one.
+
 ### Why the numbers are $10 and $1
 
 `EarlyWarningBudgetUsd = 1`. Measured Bedrock spend on this account is $0.00,
@@ -217,17 +242,23 @@ and nothing will tell you if you skip it.
   nothing anywhere saying there used to be one.
 
   ```bash
-  aws sns get-topic-attributes --region ap-southeast-2 \
+  aws sns list-subscriptions-by-topic --region ap-southeast-2 \
     --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
-    --query 'Attributes.{Confirmed:SubscriptionsConfirmed,Pending:SubscriptionsPending}'
+    --query 'Subscriptions[].{Protocol:Protocol,Endpoint:Endpoint}' --output table
   ```
 
-  Expect two confirmed subscriptions: the `bench-extract-kill-switch` Lambda
-  and the email. The Lambda one confirms itself, so a count of 1 means the
-  email is gone and the kill switch will fire without telling anyone. The fix
-  is a redeploy to recreate the pending subscription, then clicking the link.
-  Verified missing on 2026-08-17 for exactly this reason, nine days after the
-  topic was created on 2026-08-08.
+  Expect two rows, one `lambda` and one `email`. A single `lambda` row means the
+  email is gone and the kill switch will fire without telling anyone.
+
+  List the subscriptions; do not count them. `aws sns get-topic-attributes` is
+  the shorter command and it is the one that misleads. With the email deleted it
+  reports `SubscriptionsConfirmed: 1` and `SubscriptionsPending: 0`, which reads
+  as a healthy topic, because the kill-switch Lambda subscribes itself and needs
+  no confirmation. The count is never 0 and never says anything about the email.
+
+  The fix is a redeploy to recreate the pending subscription, then clicking the
+  link. Verified missing on 2026-08-17 for exactly this reason, nine days after
+  the topic was created on 2026-08-08.
 - Confirm `Cors.AllowOrigins` in `template.yaml` matches the real deployed
   domains (currently `simostack.com` / `www.simostack.com`).
 
@@ -370,12 +401,108 @@ role `sam-app-BenchExtractFunctionRole-JkOIOYE75BYa` and policy
    add-listing flow, because a successful reverse still leaves a cold IAM cache
    for a short window and the first call afterwards can still fail.
 
+## Testing the kill switch
+
+The chain has never fired in anger, so until this drill is run the only evidence
+it works is that the template reads correctly. Run it before relying on the
+breaker, and again after any deploy that recreates the SNS topic, because a
+recreated topic starts with an unconfirmed email subscription and a three-day
+fuse on it.
+
+**1. Confirm the email subscription is actually there.** This is a precondition,
+not a formality: the notification half is the half that silently disappears and
+the half this drill exists to test.
+
+```bash
+aws sns list-subscriptions-by-topic --region ap-southeast-2 \
+  --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+  --query 'Subscriptions[].{Protocol:Protocol,Endpoint:Endpoint}' --output table
+```
+
+Two rows, `lambda` and `email`. If only the `lambda` row is there, stop and fix
+that first ("After deploy" above). Running the drill against a topic with no
+email on it can only exercise the half that was never in doubt, and it will look
+like a pass.
+
+**2. Fire the alarm.** Check it reads `OK` first. `set-alarm-state` invokes
+actions only when the state actually changes, so forcing `ALARM` on an alarm
+already in `ALARM` does nothing and reads as a broken chain.
+
+```bash
+aws cloudwatch describe-alarms --region ap-southeast-2 \
+  --alarm-names bench-extract-high-invocations \
+  --query 'MetricAlarms[0].StateValue' --output text
+
+aws cloudwatch set-alarm-state --region ap-southeast-2 \
+  --alarm-name bench-extract-high-invocations \
+  --state-value ALARM \
+  --state-reason 'Manual drill of the kill-switch chain.'
+```
+
+This drives the alarm's real `AlarmActions`, so one command exercises every hop:
+alarm → SNS → the kill-switch Lambda *and* the email subscription. It changes no
+configuration. The forced state is transient, overwritten from the metric at the
+next evaluation period, so the alarm returns to `OK` within about five minutes on
+its own. That return fires nothing, because the alarm has no `OKActions`;
+restoring concurrency in step 4 is still manual and still yours.
+
+Two things this deliberately is not:
+
+- **Not `aws lambda invoke` on `bench-extract-kill-switch`.** It is the obvious
+  move and it tests the wrong thing. The email comes from SNS fanning the
+  message out to its second subscriber, not from the kill-switch Lambda, which
+  only calls `PutFunctionConcurrency` and logs. Invoking the function directly
+  drives concurrency to 0 while skipping the notification path entirely, which
+  is the exact blind spot this drill exists to close.
+- **Not lowering the alarm threshold.** That edits a live guardrail and then
+  depends on you remembering to put it back, and it still needs real traffic
+  before it trips.
+
+To exercise the topic and below without involving the alarm, which is the useful
+check straight after a redeploy has recreated the email subscription:
+
+```bash
+aws sns publish --region ap-southeast-2 \
+  --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+  --subject 'DRILL: bench-extract kill switch' \
+  --message 'Manual drill, not a real alarm. Expect concurrency 0 on bench-extract.'
+```
+
+**3. Pass condition, both halves.**
+
+```bash
+aws lambda get-function-concurrency --function-name bench-extract \
+  --region ap-southeast-2
+```
+
+1. `ReservedConcurrentExecutions` reads `0`.
+2. The alarm email arrives at `AlertEmail`. Allow a minute.
+
+Half a pass is a fail, and specifically a fail that needs fixing before the
+breaker means anything. Checking concurrency alone is exactly what let the
+missing subscription sit undetected from 2026-08-08 to 2026-08-17.
+
+**4. Restore.** Nothing does this for you; the chain has no OK action, on
+purpose.
+
+```bash
+aws lambda put-function-concurrency \
+  --function-name bench-extract --reserved-concurrent-executions 1
+```
+
+**What the drill still does not cover:** whether the alarm decides to fire at
+the right moment. `set-alarm-state` forces the transition rather than earning it,
+so everything from `ALARM` onward is proven while the `Invocations` metric, the
+`FunctionName` dimension, the 300-second period and the threshold of 100 are all
+still taken on trust. Only real traffic exercises those. The honest claim after a
+passing drill is "the chain fires correctly once the alarm fires", not "the alarm
+fires at the right time".
+
 ## Not yet done
 
-- The alarm → SNS → kill-switch chain has not been exercised end to end. Worth
-  one deliberate test after deploy (temporarily drop the alarm threshold, or
-  invoke `bench-extract-kill-switch` directly) to confirm it can actually set
-  concurrency to 0, then restore concurrency to 1.
+- The alarm → SNS → kill-switch chain has not been exercised end to end. The
+  drill is written up under "Testing the kill switch" above; run it once the
+  email subscription is confirmed.
 - **The SNS email subscription on the alarm topic is currently missing** (checked
   2026-08-17: one confirmed subscriber, the kill-switch Lambda). It expired
   unconfirmed. Until a redeploy recreates it and the link is clicked, the kill
