@@ -83,7 +83,7 @@ nothing for vitest to run; `cfn-lint` is the equivalent check. If bench-auth
 ever grows Lambda code (a pre-sign-up trigger, say), add a `npm test` step
 rather than replacing the lint one.
 
-## Deployed state (verified 2026-08-17)
+## Deployed state (verified 2026-08-21)
 
 - The bench-extract stack is deployed in **`ap-southeast-2` under the stack name
   `sam-app`**, the `--guided` default, never changed. There is no stack named
@@ -91,22 +91,30 @@ rather than replacing the lint one.
   easy mistake. The Lambda itself is `bench-extract`.
 - Reserved concurrency is 1, matching the template. `bench-extract-high-invocations`
   (logical ID `BenchHighInvocationAlarm`) is in `OK`.
-- Budget parameters are now deliberate values, not placeholders:
+- Budget parameters are deliberate values, not placeholders:
   `BudgetMonthlyLimitUsd=10` and `EarlyWarningBudgetUsd=1`, justified in
-  `bench-extract/README.md` under "Why the numbers are $10 and $1". **The live
-  stack still runs the old `5`**, because the change landed in `template.yaml`
-  and the gitignored `samconfig.toml` and takes effect on the next deploy.
-- **The SNS email subscription on `bench-extract-invocation-alarm` is missing.**
-  The topic has exactly one confirmed subscriber, the kill-switch Lambda. The
-  email subscription the template declares was created `PendingConfirmation` on
-  2026-08-08, was never confirmed, and SNS deleted it after about three days. It
-  reads as absent rather than pending, so a naive check sees a healthy topic. The
-  kill switch therefore fires silently today. Budget notifications are unaffected:
-  Budgets' EMAIL subscribers have no confirmation handshake. **A redeploy does
-  not fix it**: the subscription is inline on the topic, `AlertEmail` is
-  unchanged, so CloudFormation puts the topic in no changeset. Drift detection
-  reports it `MODIFIED` / `/Subscription/0` `REMOVE`d and does not remediate.
-  Re-subscribe with `aws sns subscribe`, then click the link within three days.
+  `bench-extract/README.md` under "Why the numbers are $10 and $1". Deployed
+  2026-08-21; `bench-bedrock-monthly` reads `10.0 USD` live.
+- **The SNS email subscription on `bench-extract-invocation-alarm` is live and
+  authenticated as of 2026-08-21** (`PendingConfirmation: false`,
+  `ConfirmationWasAuthenticated: true`). It was missing before that: the
+  subscription the template declares inline was created `PendingConfirmation` on
+  2026-08-08, was never confirmed, and SNS deleted it after about three days,
+  reading as absent rather than pending so a naive check saw a healthy topic.
+  **Check the attribute with `aws sns get-subscription-attributes`, not the row**;
+  an `email` row in `list-subscriptions-by-topic` is what looked healthy before.
+  Confirming it by clicking the link in the email produced a confirmation and a
+  deactivation timestamped the same minute: SNS unsubscribe is an unauthenticated
+  GET, so a browser prefetch or mail scanner fires it. It was re-created with
+  `aws sns subscribe` and confirmed with `aws sns confirm-subscription
+  --authenticate-on-unsubscribe true`, which makes unsubscribing require a
+  signed request. That flag is settable only at confirmation time. Budget
+  notifications were never affected: Budgets' EMAIL subscribers have no
+  confirmation handshake.
+  **A redeploy would not have fixed it**: the subscription is inline on the topic,
+  `AlertEmail` is unchanged, so CloudFormation puts the topic in no changeset.
+  Drift detection reports it `MODIFIED` / `/Subscription/0` `REMOVE`d and does not
+  remediate.
 - **The AWS CLI and SAM CLI are installed here and credentials are live and
   admin-level.** `sam validate --lint` passes against `template.yaml`, and
   read-only `aws` calls work. This means a deploy is *possible* from this
@@ -211,7 +219,8 @@ sign up and spend the Bedrock budget. That is accepted, but it makes
 
 The alarm → SNS → kill-switch chain has never fired. `SECURITY.md` claims it
 works. Before opening sign-up, run the "Testing the kill switch" drill in
-`bench-extract/README.md`: confirm the topic has both subscribers, force the
+`bench-extract/README.md`: assert the email subscription's
+`ConfirmationWasAuthenticated: true` rather than just its row, force the
 alarm with `aws cloudwatch set-alarm-state`, then check **both** halves, reserved
 concurrency at 0 and the email actually arriving. Do not invoke the kill-switch
 Lambda directly. It publishes nothing, so that tests the concurrency half and

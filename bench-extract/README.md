@@ -54,7 +54,10 @@ Layer 3 does two things off one SNS topic, and they do not stand or fall
 together. Stopping the spend is the kill-switch Lambda, subscribed by
 CloudFormation, which confirms itself and stays subscribed. Telling you it
 happened is an email subscription on the same topic, which needs a human to
-click a link and is deleted if nobody does within about three days.
+confirm it and is deleted if nobody does within about three days. Worse, the
+obvious way to confirm it, clicking the link in the email, leaves the
+subscription deletable by anything that issues an unauthenticated GET. See
+"After deploy" for the confirmation that does not rot.
 
 So the expected failure is the notification half alone, and it is asymmetric in
 an unhelpful direction. Spend still stops: the alarm fires, the Lambda zeroes
@@ -231,8 +234,8 @@ and nothing will tell you if you skip it.
   Note that the script only checks the local `.env`. A stale GitHub Actions
   secret is invisible to it and to every local test, and shows up only as a
   broken deployed site, so update the secret in the same sitting.
-- **Confirm the SNS alarm subscription, and do it within three days.** This is
-  the one alerting path with a confirmation handshake, and it is the one that
+- **Confirm the SNS alarm subscription from the CLI, within three days.** This
+  is the one alerting path with a confirmation handshake, and it is the one that
   silently rots. The two budgets use Budgets' own EMAIL subscribers, which have
   no confirmation step and start working immediately. The SNS topic does not:
   CloudFormation creates the email subscription in `PendingConfirmation`, AWS
@@ -242,19 +245,32 @@ and nothing will tell you if you skip it.
   nothing anywhere saying there used to be one.
 
   ```bash
-  aws sns list-subscriptions-by-topic --region ap-southeast-2 \
+  SUB=$(aws sns list-subscriptions-by-topic --region ap-southeast-2 \
     --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
-    --query 'Subscriptions[].{Protocol:Protocol,Endpoint:Endpoint}' --output table
+    --query "Subscriptions[?Protocol=='email'].SubscriptionArn" --output text)
+
+  aws sns get-subscription-attributes --region ap-southeast-2 \
+    --subscription-arn "$SUB" \
+    --query 'Attributes.{Pending:PendingConfirmation,Authenticated:ConfirmationWasAuthenticated}'
   ```
 
-  Expect two rows, one `lambda` and one `email`. A single `lambda` row means the
-  email is gone and the kill switch will fire without telling anyone.
+  **The assertion is `ConfirmationWasAuthenticated: true`, not the presence of an
+  `email` row.** A row is what a healthy topic and a topic about to lose its
+  email look like alike, because a subscription confirmed by clicking the link
+  stays one unauthenticated GET away from deletion and shows up as a normal row
+  until the moment it goes. Require `PendingConfirmation: false` **and**
+  `ConfirmationWasAuthenticated: true`; `false` on the second means re-do the
+  confirmation below.
 
-  List the subscriptions; do not count them. `aws sns get-topic-attributes` is
-  the shorter command and it is the one that misleads. With the email deleted it
-  reports `SubscriptionsConfirmed: 1` and `SubscriptionsPending: 0`, which reads
-  as a healthy topic, because the kill-switch Lambda subscribes itself and needs
-  no confirmation. The count is never 0 and never says anything about the email.
+  A `$SUB` of `PendingConfirmation` or `Deleted` is a placeholder rather than an
+  ARN and the second command fails on it. An empty `$SUB` means no email row at
+  all. Both mean the same fix, below.
+
+  Do not substitute `aws sns get-topic-attributes`. It is the shorter command and
+  it is the one that misleads. With the email deleted it reports
+  `SubscriptionsConfirmed: 1` and `SubscriptionsPending: 0`, which reads as a
+  healthy topic, because the kill-switch Lambda subscribes itself and needs no
+  confirmation. The count is never 0 and never says anything about the email.
 
   **A redeploy does not fix this.** The subscription is declared inline on
   `BenchInvocationAlarmTopic`, so recreating it needs CloudFormation to update
@@ -265,17 +281,37 @@ and nothing will tell you if you skip it.
   reports the topic `MODIFIED` with `/Subscription/0` `REMOVE`d, and drift is
   never remediated on update.
 
-  Re-subscribe directly instead, then click the link within three days:
+  Re-subscribe directly instead, and confirm from the CLI rather than the link:
 
   ```bash
   aws sns subscribe --region ap-southeast-2 \
     --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
     --protocol email --notification-endpoint <AlertEmail>
+
+  # Copy the "Confirm subscription" link out of the email without opening it,
+  # and pass its Token= value here. The token expires in about three days.
+  aws sns confirm-subscription --region ap-southeast-2 \
+    --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+    --token <Token from the confirmation URL> \
+    --authenticate-on-unsubscribe true
   ```
 
+  **Why the two-step CLI dance instead of clicking the link.** Both SNS
+  confirmation and SNS unsubscribe are unauthenticated GETs, so anything that
+  fetches a URL can fire either one: Chrome's link prefetch, a mail scanner, an
+  AV extension, or the "click here to unsubscribe" link that AWS puts on the
+  confirmation landing page itself. Clicking the link on 2026-08-19 produced a
+  confirmation email and a deactivation email timestamped the same minute.
+  `--authenticate-on-unsubscribe true` makes `Unsubscribe` require a signed
+  request from the topic or subscription owner, which leaves the link in every
+  future alarm email inert and closes the failure mode permanently. It can only
+  be set at confirmation time, so a subscription confirmed by clicking cannot be
+  upgraded; it has to be torn down and redone.
+
   This moves the live topic back to what the template already declares, so it
-  clears the drift rather than adding more. Verified missing on 2026-08-17 for
-  exactly this reason, nine days after the topic was created on 2026-08-08.
+  clears the drift rather than adding more. Verified missing on 2026-08-17, nine
+  days after the topic was created on 2026-08-08, and re-created and confirmed
+  with the authenticated flag on 2026-08-21.
 - Confirm `Cors.AllowOrigins` in `template.yaml` matches the real deployed
   domains (currently `simostack.com` / `www.simostack.com`).
 
@@ -426,20 +462,32 @@ breaker, and again after any deploy that recreates the SNS topic, because a
 recreated topic starts with an unconfirmed email subscription and a three-day
 fuse on it.
 
-**1. Confirm the email subscription is actually there.** This is a precondition,
-not a formality: the notification half is the half that silently disappears and
-the half this drill exists to test.
+**1. Assert the email subscription is confirmed and protected.** This is a
+precondition, not a formality: the notification half is the half that silently
+disappears and the half this drill exists to test.
 
 ```bash
-aws sns list-subscriptions-by-topic --region ap-southeast-2 \
+SUB=$(aws sns list-subscriptions-by-topic --region ap-southeast-2 \
   --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
-  --query 'Subscriptions[].{Protocol:Protocol,Endpoint:Endpoint}' --output table
+  --query "Subscriptions[?Protocol=='email'].SubscriptionArn" --output text)
+
+aws sns get-subscription-attributes --region ap-southeast-2 \
+  --subscription-arn "$SUB" \
+  --query 'Attributes.{Pending:PendingConfirmation,Authenticated:ConfirmationWasAuthenticated}'
 ```
 
-Two rows, `lambda` and `email`. If only the `lambda` row is there, stop and fix
-that first ("After deploy" above). Running the drill against a topic with no
-email on it can only exercise the half that was never in doubt, and it will look
-like a pass.
+Require `PendingConfirmation: false` **and** `ConfirmationWasAuthenticated:
+true`. **Do not assert on the `email` row instead.** A visible row is precisely
+what looked healthy before this went wrong: a link-confirmed subscription reads
+as a normal row and stays deletable by any unauthenticated GET, so the drill can
+pass on Monday and the notification half can be gone on Tuesday with nothing
+changed. Only the attribute distinguishes a subscription that will still be
+there next time from one that happens to be there now.
+
+Anything other than those two values, including a `$SUB` of `PendingConfirmation`
+or `Deleted` or an empty one, means stop and fix that first ("After deploy"
+above). Running the drill against a topic with no live email on it can only
+exercise the half that was never in doubt, and it will look like a pass.
 
 **2. Fire the alarm.** Check it reads `OK` first. `set-alarm-state` invokes
 actions only when the state actually changes, so forcing `ALARM` on an alarm
@@ -518,13 +566,8 @@ fires at the right time".
 ## Not yet done
 
 - The alarm → SNS → kill-switch chain has not been exercised end to end. The
-  drill is written up under "Testing the kill switch" above; run it once the
-  email subscription is confirmed.
-- **The SNS email subscription on the alarm topic is currently missing** (checked
-  2026-08-17: one confirmed subscriber, the kill-switch Lambda). It expired
-  unconfirmed. Until it is re-created with `aws sns subscribe` and the link is
-  clicked, the kill switch will fire silently. A redeploy will not do it; see
-  "After deploy". The budget emails are unaffected.
+  drill is written up under "Testing the kill switch" above. Its precondition,
+  a confirmed email subscription, is now met, so nothing blocks running it.
 - The budget-action reverse procedure above is written but, like the kill switch,
   has never been run. It is derived from the template and the Budgets API, not
   from an observed trip.
