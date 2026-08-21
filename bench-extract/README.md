@@ -48,6 +48,69 @@ Plus an email-only budget at `EarlyWarningBudgetUsd` (default $1) that stops
 nothing and exists so the first news of creeping spend is not a breaker
 tripping.
 
+### Layer 3's two halves fail independently
+
+Layer 3 does two things off one SNS topic, and they do not stand or fall
+together. Stopping the spend is the kill-switch Lambda, subscribed by
+CloudFormation, which confirms itself and stays subscribed. Telling you it
+happened is an email subscription on the same topic, which needs a human to
+confirm it and is deleted if nobody does within about three days. Worse, the
+obvious way to confirm it, clicking the link in the email, leaves the
+subscription deletable by anything that issues an unauthenticated GET. See
+"After deploy" for the confirmation that does not rot.
+
+So the expected failure is the notification half alone, and it is asymmetric in
+an unhelpful direction. Spend still stops: the alarm fires, the Lambda zeroes
+reserved concurrency, and nothing reaches Bedrock. What is lost is any account
+of why. The tool is simply down, every request throttles, and no message exists
+anywhere connecting that to a breaker. **Read a kill-switch trip as an outage
+that arrives with no explanation attached, not as an alert you might have
+missed.** Reserved concurrency at 0 on `bench-extract` is the only symptom, and
+you only see it if you already suspected it.
+
+The diagnostic surface hides this rather than surfacing it. The topic reports
+`SubscriptionsConfirmed: 1`, which looks like a healthy topic and is not: the
+one confirmed subscriber is the Lambda doing the killing, not the human being
+told about it. That count cannot distinguish "email confirmed" from "email
+deleted", so checking it is worse than not checking. "After deploy" below has
+the check that does work, and "Testing the kill switch" has the drill that
+exercises both halves rather than the easy one.
+
+### Why the numbers are $10 and $1
+
+`EarlyWarningBudgetUsd = 1`. Measured Bedrock spend on this account is $0.00,
+so $1 is a clean anomaly signal rather than a threshold with a margin in it.
+Being wrong costs one email.
+
+`BudgetMonthlyLimitUsd = 10`, not 5:
+
+- Expected worst-case personal usage came out around $3.25/month. Against $5
+  that is only about 35% headroom, and it sits on top of a per-token rate that
+  was estimated, not verified. Retries, or listing text longer than the 4k-token
+  sample the estimate was built from, eat that headroom.
+- The two failure directions are not symmetric. Overshooting costs a few dollars
+  and is already bounded from below by faster layers: the kill switch caps any
+  single incident at roughly $0.65, and `ReservedConcurrentExecutions: 1` caps
+  the burn rate. Undershooting fires the explicit `Deny` on the execution role,
+  so real users get `AccessDenied` and the first notice of it is somebody
+  mentioning the site is broken.
+- $10 is still roughly 1,500x measured spend. It has not stopped being a smoke
+  alarm.
+
+Two bounds on what this number can actually do, both worth knowing before
+leaning on it:
+
+- **It is the slow-leak detector, not the fast breaker.** It runs on Cost
+  Explorer data and lags 6-24 hours, so it cannot catch a runaway loop inside
+  the window that matters. Layers 1-3 above are what bound a fast incident;
+  this layer bounds a slow one.
+- **It is account-wide for Bedrock, not scoped to this function.** The
+  `CostFilters` on the budget select the Amazon Bedrock service, not this
+  Lambda, because per-function attribution is not available at that granularity.
+  So any second Bedrock workload on this account shares the same $10 and will
+  drag the breaker toward tripping on spend this function never caused. Adding
+  one is the trigger to revisit the number, and probably to split the budget.
+
 ## First deploy
 
 Requires the [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
@@ -85,8 +148,8 @@ review. Do them first, per account and per region.
   The `models[].modelArn` values it returns are exactly the foundation-model
   ARNs the IAM policy grants; if that list ever changes, the policy needs the
   same edit. `BedrockRegion` must stay inside the profile's geography
-  (`ap-southeast-2` or `ap-southeast-4`) — unlike a bare foundation-model ID,
-  it can't be repointed at `us-east-1` to chase availability.
+  (`ap-southeast-2` or `ap-southeast-4`). Unlike a bare foundation-model ID, it
+  can't be repointed at `us-east-1` to chase availability.
 - **Lower the Bedrock on-demand rate quota** to roughly 1-2x realistic personal
   usage. Do this early, not during an incident: the Service Quotas console form
   is built for _increases_, and a decrease generally needs a support case.
@@ -171,13 +234,86 @@ and nothing will tell you if you skip it.
   Note that the script only checks the local `.env`. A stale GitHub Actions
   secret is invisible to it and to every local test, and shows up only as a
   broken deployed site, so update the secret in the same sitting.
-- **Confirm every `AlertEmail` subscription.** The two budgets and the SNS
-  alarm topic each send their own confirmation link, and each is silent until
-  clicked. Check they show `Confirmed`; do not assume.
+- **Confirm the SNS alarm subscription from the CLI, within three days.** This
+  is the one alerting path with a confirmation handshake, and it is the one that
+  silently rots. The two budgets use Budgets' own EMAIL subscribers, which have
+  no confirmation step and start working immediately. The SNS topic does not:
+  CloudFormation creates the email subscription in `PendingConfirmation`, AWS
+  emails a link, and **an unconfirmed subscription is deleted after about three
+  days**. When that happens it does not show up as `PendingConfirmation`, it
+  disappears entirely, so a later check finds a topic with no email on it and
+  nothing anywhere saying there used to be one.
+
+  ```bash
+  SUB=$(aws sns list-subscriptions-by-topic --region ap-southeast-2 \
+    --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+    --query "Subscriptions[?Protocol=='email'].SubscriptionArn" --output text)
+
+  aws sns get-subscription-attributes --region ap-southeast-2 \
+    --subscription-arn "$SUB" \
+    --query 'Attributes.{Pending:PendingConfirmation,Authenticated:ConfirmationWasAuthenticated}'
+  ```
+
+  **The assertion is `ConfirmationWasAuthenticated: true`, not the presence of an
+  `email` row.** A row is what a healthy topic and a topic about to lose its
+  email look like alike, because a subscription confirmed by clicking the link
+  stays one unauthenticated GET away from deletion and shows up as a normal row
+  until the moment it goes. Require `PendingConfirmation: false` **and**
+  `ConfirmationWasAuthenticated: true`; `false` on the second means re-do the
+  confirmation below.
+
+  A `$SUB` of `PendingConfirmation` or `Deleted` is a placeholder rather than an
+  ARN and the second command fails on it. An empty `$SUB` means no email row at
+  all. Both mean the same fix, below.
+
+  Do not substitute `aws sns get-topic-attributes`. It is the shorter command and
+  it is the one that misleads. With the email deleted it reports
+  `SubscriptionsConfirmed: 1` and `SubscriptionsPending: 0`, which reads as a
+  healthy topic, because the kill-switch Lambda subscribes itself and needs no
+  confirmation. The count is never 0 and never says anything about the email.
+
+  **A redeploy does not fix this.** The subscription is declared inline on
+  `BenchInvocationAlarmTopic`, so recreating it needs CloudFormation to update
+  that topic, and CloudFormation only updates resources whose declared
+  properties changed. `AlertEmail` has not changed, so the topic is absent from
+  the changeset and the deploy leaves the gap exactly as it found it.
+  CloudFormation can see the gap and still will not close it: drift detection
+  reports the topic `MODIFIED` with `/Subscription/0` `REMOVE`d, and drift is
+  never remediated on update.
+
+  Re-subscribe directly instead, and confirm from the CLI rather than the link:
+
+  ```bash
+  aws sns subscribe --region ap-southeast-2 \
+    --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+    --protocol email --notification-endpoint <AlertEmail>
+
+  # Copy the "Confirm subscription" link out of the email without opening it,
+  # and pass its Token= value here. The token expires in about three days.
+  aws sns confirm-subscription --region ap-southeast-2 \
+    --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+    --token <Token from the confirmation URL> \
+    --authenticate-on-unsubscribe true
+  ```
+
+  **Why the two-step CLI dance instead of clicking the link.** Both SNS
+  confirmation and SNS unsubscribe are unauthenticated GETs, so anything that
+  fetches a URL can fire either one: Chrome's link prefetch, a mail scanner, an
+  AV extension, or the "click here to unsubscribe" link that AWS puts on the
+  confirmation landing page itself. Clicking the link on 2026-08-19 produced a
+  confirmation email and a deactivation email timestamped the same minute.
+  `--authenticate-on-unsubscribe true` makes `Unsubscribe` require a signed
+  request from the topic or subscription owner, which leaves the link in every
+  future alarm email inert and closes the failure mode permanently. It can only
+  be set at confirmation time, so a subscription confirmed by clicking cannot be
+  upgraded; it has to be torn down and redone.
+
+  This moves the live topic back to what the template already declares, so it
+  clears the drift rather than adding more. Verified missing on 2026-08-17, nine
+  days after the topic was created on 2026-08-08, and re-created and confirmed
+  with the authenticated flag on 2026-08-21.
 - Confirm `Cors.AllowOrigins` in `template.yaml` matches the real deployed
   domains (currently `simostack.com` / `www.simostack.com`).
-- Pick real values for `BudgetMonthlyLimitUsd` and `EarlyWarningBudgetUsd`. The
-  defaults (5 and 1) are placeholders.
 
 ## Access token
 
@@ -228,19 +364,214 @@ Otherwise: `sam build && sam deploy`.
 Neither circuit breaker self-heals, on purpose. If one fired, something was
 wrong and it should be understood before the endpoint is live again.
 
-After the kill switch fired:
+Work out **which** one fired before touching anything. They present differently:
+
+- **Kill switch:** requests to the Function URL are throttled outright. Reserved
+  concurrency reads 0.
+- **Budget action:** the Function URL still answers, the handler still runs, and
+  only the Bedrock call fails, with `AccessDenied` on `bedrock:InvokeModel`. This
+  reads like a Bedrock outage or a broken IAM change rather than a breaker doing
+  its job, which is why the procedure below exists.
+
+### After the kill switch fired
 
 ```bash
 aws lambda put-function-concurrency \
   --function-name bench-extract --reserved-concurrent-executions 1
 ```
 
-After the budget action fired: Budgets → Actions → Revert, in the console.
+### After the budget action fired
+
+The deny is a managed policy (`BenchDenyBedrockPolicy`) that AWS Budgets
+attaches to the function's execution role. A `Deny` beats the role's own
+`Allow`, so nothing else about the function changes. Do not fix this by editing
+IAM by hand: reverse the action, so Budgets' own record of state matches
+reality and the action returns to `STANDBY` armed for next time.
+
+Physical names carry a stack-generated suffix and change if the stack is ever
+replaced, so discover them rather than pasting them. As of 2026-08-17 they are
+role `sam-app-BenchExtractFunctionRole-JkOIOYE75BYa` and policy
+`sam-app-BenchDenyBedrockPolicy-7gDgd1m8I3VO`.
+
+1. **Confirm it is really the budget action**, not a hand-made IAM mistake. A
+   status of `EXECUTION_SUCCESS` means it fired; `STANDBY` means it did not and
+   the `AccessDenied` is coming from somewhere else.
+
+   ```bash
+   ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+   aws budgets describe-budget-actions-for-budget \
+     --account-id "$ACCOUNT_ID" --budget-name bench-bedrock-monthly \
+     --query 'Actions[].{Id:ActionId,Status:Status}'
+   ```
+
+2. **Confirm the policy is actually attached**, which is the same fact seen from
+   the IAM side:
+
+   ```bash
+   ROLE=$(aws cloudformation describe-stack-resources \
+     --region ap-southeast-2 --stack-name sam-app \
+     --logical-resource-id BenchExtractFunctionRole \
+     --query 'StackResources[0].PhysicalResourceId' --output text)
+   aws iam list-attached-role-policies --role-name "$ROLE"
+   ```
+
+3. **Find out what spent the money before reverting.** This layer only trips on
+   real dollars, so something did. Reverting first and investigating later means
+   reopening the tap on a cause you do not understand yet.
+
+   ```bash
+   aws ce get-cost-and-usage --granularity MONTHLY \
+     --time-period Start=$(date -u +%Y-%m-01),End=$(date -u -d '+1 month' +%Y-%m-01) \
+     --metrics UnblendedCost --group-by Type=DIMENSION,Key=SERVICE \
+     --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Bedrock"]}}'
+   ```
+
+   Cross-check against the function's own logs for the same window, since the
+   budget is account-wide and the spend may not be this function's at all.
+
+4. **Decide the limit before reversing, not after.** If actual spend is still
+   above `BudgetMonthlyLimitUsd`, the action re-fires on the next evaluation and
+   you get the same `AccessDenied` back within hours. So either raise
+   `BudgetMonthlyLimitUsd` and deploy first, or accept that Bedrock stays denied
+   until the calendar month rolls over and the budget resets.
+
+5. **Reverse the action.**
+
+   ```bash
+   aws budgets execute-budget-action \
+     --account-id "$ACCOUNT_ID" --budget-name bench-bedrock-monthly \
+     --action-id <action-id-from-step-1> \
+     --execution-type REVERSE_BUDGET_ACTION
+   ```
+
+   Console equivalent: Billing → Budgets → `bench-bedrock-monthly` → Actions →
+   Revert. Note that `aws budgets` is a global endpoint, so these calls need no
+   `--region`, unlike every other command in this file.
+
+6. **Verify both sides came back.** Re-run steps 1 and 2: status should return to
+   `STANDBY` and `list-attached-role-policies` should no longer list
+   `BenchDenyBedrockPolicy`. Then exercise the real path once through the site's
+   add-listing flow, because a successful reverse still leaves a cold IAM cache
+   for a short window and the first call afterwards can still fail.
+
+## Testing the kill switch
+
+The chain has never fired in anger, so until this drill is run the only evidence
+it works is that the template reads correctly. Run it before relying on the
+breaker, and again after any deploy that recreates the SNS topic, because a
+recreated topic starts with an unconfirmed email subscription and a three-day
+fuse on it.
+
+**1. Assert the email subscription is confirmed and protected.** This is a
+precondition, not a formality: the notification half is the half that silently
+disappears and the half this drill exists to test.
+
+```bash
+SUB=$(aws sns list-subscriptions-by-topic --region ap-southeast-2 \
+  --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+  --query "Subscriptions[?Protocol=='email'].SubscriptionArn" --output text)
+
+aws sns get-subscription-attributes --region ap-southeast-2 \
+  --subscription-arn "$SUB" \
+  --query 'Attributes.{Pending:PendingConfirmation,Authenticated:ConfirmationWasAuthenticated}'
+```
+
+Require `PendingConfirmation: false` **and** `ConfirmationWasAuthenticated:
+true`. **Do not assert on the `email` row instead.** A visible row is precisely
+what looked healthy before this went wrong: a link-confirmed subscription reads
+as a normal row and stays deletable by any unauthenticated GET, so the drill can
+pass on Monday and the notification half can be gone on Tuesday with nothing
+changed. Only the attribute distinguishes a subscription that will still be
+there next time from one that happens to be there now.
+
+Anything other than those two values, including a `$SUB` of `PendingConfirmation`
+or `Deleted` or an empty one, means stop and fix that first ("After deploy"
+above). Running the drill against a topic with no live email on it can only
+exercise the half that was never in doubt, and it will look like a pass.
+
+**2. Fire the alarm.** Check it reads `OK` first. `set-alarm-state` invokes
+actions only when the state actually changes, so forcing `ALARM` on an alarm
+already in `ALARM` does nothing and reads as a broken chain.
+
+```bash
+aws cloudwatch describe-alarms --region ap-southeast-2 \
+  --alarm-names bench-extract-high-invocations \
+  --query 'MetricAlarms[0].StateValue' --output text
+
+aws cloudwatch set-alarm-state --region ap-southeast-2 \
+  --alarm-name bench-extract-high-invocations \
+  --state-value ALARM \
+  --state-reason 'Manual drill of the kill-switch chain.'
+```
+
+This drives the alarm's real `AlarmActions`, so one command exercises every hop:
+alarm → SNS → the kill-switch Lambda *and* the email subscription. It changes no
+configuration. The forced state is transient, overwritten from the metric at the
+next evaluation period, so the alarm returns to `OK` within about five minutes on
+its own. That return fires nothing, because the alarm has no `OKActions`;
+restoring concurrency in step 4 is still manual and still yours.
+
+Two things this deliberately is not:
+
+- **Not `aws lambda invoke` on `bench-extract-kill-switch`.** It is the obvious
+  move and it tests the wrong thing. The email comes from SNS fanning the
+  message out to its second subscriber, not from the kill-switch Lambda, which
+  only calls `PutFunctionConcurrency` and logs. Invoking the function directly
+  drives concurrency to 0 while skipping the notification path entirely, which
+  is the exact blind spot this drill exists to close.
+- **Not lowering the alarm threshold.** That edits a live guardrail and then
+  depends on you remembering to put it back, and it still needs real traffic
+  before it trips.
+
+To exercise the topic and below without involving the alarm, which is the useful
+check straight after re-subscribing the email endpoint:
+
+```bash
+aws sns publish --region ap-southeast-2 \
+  --topic-arn arn:aws:sns:ap-southeast-2:<account-id>:bench-extract-invocation-alarm \
+  --subject 'DRILL: bench-extract kill switch' \
+  --message 'Manual drill, not a real alarm. Expect concurrency 0 on bench-extract.'
+```
+
+**3. Pass condition, both halves.**
+
+```bash
+aws lambda get-function-concurrency --function-name bench-extract \
+  --region ap-southeast-2
+```
+
+1. `ReservedConcurrentExecutions` reads `0`.
+2. The alarm email arrives at `AlertEmail`. Allow a minute.
+
+Half a pass is a fail, and specifically a fail that needs fixing before the
+breaker means anything. Checking concurrency alone is exactly what let the
+missing subscription sit undetected from 2026-08-08 to 2026-08-17.
+
+**4. Restore.** Nothing does this for you; the chain has no OK action, on
+purpose.
+
+```bash
+aws lambda put-function-concurrency \
+  --function-name bench-extract --reserved-concurrent-executions 1
+```
+
+**What the drill still does not cover:** whether the alarm decides to fire at
+the right moment. `set-alarm-state` forces the transition rather than earning it,
+so everything from `ALARM` onward is proven while the `Invocations` metric, the
+`FunctionName` dimension, the 300-second period and the threshold of 100 are all
+still taken on trust. Only real traffic exercises those. The honest claim after a
+passing drill is "the chain fires correctly once the alarm fires", not "the alarm
+fires at the right time".
 
 ## Not yet done
 
-- The alarm → SNS → kill-switch chain has not been exercised end to end. Worth
-  one deliberate test after deploy (temporarily drop the alarm threshold, or
-  invoke `bench-extract-kill-switch` directly) to confirm it can actually set
-  concurrency to 0, then restore concurrency to 1.
+- The alarm → SNS → kill-switch chain has not been exercised end to end. The
+  drill is written up under "Testing the kill switch" above. Its precondition,
+  a confirmed email subscription, is now met, so nothing blocks running it.
+- The budget-action reverse procedure above is written but, like the kill switch,
+  has never been run. It is derived from the template and the Budgets API, not
+  from an observed trip.
+- `BudgetMonthlyLimitUsd` is account-wide for Bedrock rather than scoped to this
+  function. A second Bedrock workload on this account is the trigger to revisit
+  the number and probably split the budget.
 - Log retention and alerting for extraction failures are not set up.

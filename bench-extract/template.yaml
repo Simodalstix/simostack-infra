@@ -93,13 +93,20 @@ Parameters:
       point of using an AU-scoped profile in the first place.
   BudgetMonthlyLimitUsd:
     Type: Number
-    Default: 5
+    Default: 10
     Description: >
       The actual hard cap. Once this month's real Bedrock spend (account-wide,
       not just this function) reaches this amount, the BudgetsAction below
       automatically attaches a deny-bedrock policy to this function's role.
       Set it comfortably above your own expected usage so it only ever trips
       on abuse, not on you.
+
+      10, not 5, because the headroom above expected spend sits on top of a
+      per-token rate that was never verified, and the two failure directions
+      are not symmetric: overshooting costs a few dollars and is already
+      bounded by the kill switch and reserved concurrency, while undershooting
+      fires the Deny below and real users get AccessDenied. The README has the
+      full justification and the two bounds on what this number can do.
   EarlyWarningBudgetUsd:
     Type: Number
     Default: 1
@@ -107,8 +114,8 @@ Parameters:
       A second, much lower budget that only sends email. It attaches no deny
       policy and stops nothing. Its whole job is to tell you that spend has
       started moving while the number is still small, so you find out from a
-      $1 note rather than from the $5 circuit breaker tripping. Set it just
-      above a normal month's usage.
+      $1 note rather than from the BudgetMonthlyLimitUsd circuit breaker
+      tripping. Set it just above a normal month's usage.
   AlertEmail:
     Type: String
     Description: >
@@ -192,8 +199,9 @@ Resources:
   # action fires. A Deny always wins over the function's own Allow, so the
   # function itself keeps existing and its Function URL keeps responding.
   # It just gets a Bedrock AccessDenied on every call until this policy is
-  # detached again (console: Budgets > Actions > Revert, or `aws budgets
-  # describe-budget-actions` + a manual detach).
+  # detached again. Detach it by reversing the budget action, not by editing IAM
+  # by hand, so Budgets' own state matches reality and the action re-arms. The
+  # README's "After the budget action fired" checklist is the procedure.
   BenchDenyBedrockPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
@@ -382,7 +390,7 @@ Resources:
           )
         }
 
-  # Email-only early warning, separate from the $5 enforcement budget above.
+  # Email-only early warning, separate from the enforcement budget above.
   # A budget that both warns and enforces has to be set at the pain threshold,
   # which means the first thing you hear about creeping spend is the circuit
   # breaker. Splitting them lets the warning sit low and the cap sit high.

@@ -119,8 +119,8 @@ code executes. That is why the kill switch uses it.
 ### Budgets lag; CloudWatch does not
 
 **AWS Budgets runs on Cost Explorer data and can lag 6-24 hours.** A
-`BudgetsAction` that denies at $5 may not fire until long after $5 is spent. It
-is a real cap on the _month_ and useless against a loop that starts at 11pm.
+`BudgetsAction` that denies at $10 may not fire until long after $10 is spent.
+It is a real cap on the _month_ and useless against a loop that starts at 11pm.
 
 So pair it with a CloudWatch alarm on the function's own `Invocations` metric,
 landing in about a minute, wired through SNS to a Lambda that calls
@@ -144,7 +144,7 @@ is one command, so err fast.
 A budget that both warns and enforces has to sit at the pain threshold, which
 means the first news of creeping spend is the circuit breaker tripping. Split
 them: a **low budget (~$1), email only, no action**, including a FORECASTED
-notification for the earliest possible signal, and a **high budget ($5) with
+notification for the earliest possible signal, and a **high budget ($10) with
 the deny action** as the actual cap. The low one exists to make you look while
 the number is still interesting rather than alarming.
 
@@ -173,6 +173,8 @@ deploy-time and account-level steps are in the Lambda README.
 - [ ] Separate low email-only budget, including a FORECASTED notification
 - [ ] IAM `Resource` scoped to the one model ARN, not `*`
 - [ ] Shared secret is `NoEcho` and not committed in `samconfig.toml`
+- [ ] Anyone given `cloudformation:DescribeChangeSet` on the stack is
+      trusted with every SSM-sourced parameter in it (see below)
 
 ## What none of this covers
 
@@ -186,3 +188,17 @@ Stated plainly so it is not mistaken for done:
   extraction failures from the UI, not from CloudWatch.
 - **The budget is account-wide for the Bedrock service**, not scoped to this
   function. Another Bedrock workload in the same account would share the cap.
+- **`cloudformation:DescribeChangeSet` reads SSM parameter values without
+  `ssm:GetParameter`.** A stack parameter typed
+  `AWS::SSM::Parameter::Value<String>` is resolved by CloudFormation at
+  changeset creation, and `DescribeChangeSet` returns the resolved secret in
+  each parameter's `ResolvedValue` field. So a principal denied every `ssm:*`
+  action still reads the parameter store through the changeset API, and an IAM
+  policy that only restricts `ssm:GetParameter` is not a boundary. This is a
+  property of the mechanism, not of any one parameter: it applies to every
+  SSM-sourced parameter this stack ever takes, and it outlives
+  `BenchAccessToken`, which Phase 2 of bench-auth retires. Today the exposure is
+  nil, since that token ships in the public bundle anyway, and CI holds no AWS
+  credentials and makes no CloudFormation calls. Treat it as a constraint on who
+  gets `DescribeChangeSet`, and on pasting raw changeset output anywhere, rather
+  than as a reason to avoid SSM.

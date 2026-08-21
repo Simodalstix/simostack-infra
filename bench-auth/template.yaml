@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+# NOTE: no `Transform: AWS::Serverless-2016-10-31` here, unlike
+# bench-extract/template.yaml. Every resource below is plain CloudFormation --
+# there is no Lambda, no API, nothing the SAM transform would expand. Declaring
+# the transform anyway would mean `sam build` has nothing to build and the
+# translator runs for no reason. Deploys still use `sam deploy` for consistency
+# with the sibling service; it handles a plain CFN template fine, there is just
+# no `sam build` step. See README.
+#
+# Cognito authentication for Bench. Replaces the shared x-bench-token header
+# that bench-extract checks today.
+#
+# THE CONSTRAINT THIS TEMPLATE EXISTS TO HOLD:
+#
+#   The authenticated role below gets lambda:InvokeFunctionUrl and nothing
+#   else. It must never be granted bedrock:InvokeModel.
+#
+# Three of the four layers bounding Bedrock spend are properties of the
+# bench-extract function or its execution role: ReservedConcurrentExecutions,
+# the alarm -> SNS -> kill switch (which works by zeroing THAT function's
+# concurrency), and the Budgets-triggered deny policy (attached by
+# BenchBudgetAction to exactly one role, BenchExtractFunctionRole). Issuing
+# Bedrock credentials to the browser routes spend around all three and leaves
+# the enforcement budget attached to a role nobody is using. The Lambda stays
+# the only caller of Bedrock. See ../SECURITY.md and ./README.md.
+#
+# Nothing here has been deployed. No AWS resources exist for this stack yet.
+
+Description: >
+  Bench authentication: Cognito User Pool with Google federation, an Identity
+  Pool, and an authenticated IAM role scoped to invoking the bench-extract
+  Function URL.
+
+Parameters:
+  BenchExtractFunctionArn:
+    Type: String
+    Description: >
+      ARN of the bench-extract Lambda. The authenticated role is scoped to this
+      one function. Parameterised rather than hardcoded so this stack does not
+      depend on bench-extract's stack, and can be pointed at a copy for testing.
+    AllowedPattern: '^arn:aws:lambda:[a-z0-9-]+:\d{12}:function:[A-Za-z0-9-_]+$'
+
+  GoogleClientId:
+    Type: String
+    Description: >
+      OAuth 2.0 client ID from Google Cloud Console. Not a secret; it is visible
+      in the sign-in redirect. See the README for how to obtain it.
+
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      OAuth 2.0 client secret from Google Cloud Console. A genuine secret,
+      unlike the bench-extract access token. Pass it on the command line at
+      deploy time and do NOT save it to samconfig.toml -- see the README.
+
+  CognitoDomainPrefix:
+    Type: String
+    Description: >
+      Prefix for the Cognito hosted-UI domain, giving
+      https://<prefix>.auth.<region>.amazoncognito.com. Must be globally unique
+      across all AWS accounts, and must match the prefix used to build the
+      redirect URI registered in Google Cloud Console.
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Default: 'https://simostack.com,https://www.simostack.com,http://localhost:5173,http://localhost:5199'
+    Description: >
+      Where Cognito may redirect after sign-in. Kept deliberately in step with
+      Cors.AllowOrigins in bench-extract/template.yaml; if one list gains an
+      origin the other almost certainly should too.
+
+  LogoutUrls:
+    Type: CommaDelimitedList
+    Default: 'https://simostack.com,https://www.simostack.com,http://localhost:5173,http://localhost:5199'
+    Description: Where Cognito may redirect after sign-out.
+
+Resources:
+  # Open self-service sign-up: AllowAdminCreateUserOnly is false, and there is
+  # deliberately no PreSignUp trigger gating who may register. Anyone with a
+  # Google account can sign up and spend the Bedrock budget. That is an accepted
+  # decision, not an oversight -- it makes BudgetMonthlyLimitUsd on the
+  # bench-extract stack the real security boundary rather than a placeholder.
+  BenchUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: bench-users
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      # Users authenticate through Google and never set a local password, since
+      # the client below allows only the Google IdP. This policy is here so that
+      # a native user created by hand later is not created with weak defaults.
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      MfaConfiguration: 'OFF'
+      # INACTIVE while this is being stood up and may need tearing down and
+      # redeploying. Flip to ACTIVE once real users exist -- deleting a user
+      # pool deletes its users, and they are not recoverable.
+      DeletionProtection: INACTIVE
+
+  # Hosted-UI domain. The redirect URI registered in Google Cloud Console is
+  # derived from this prefix and must be registered BEFORE this stack is first
+  # deployed, because the Google IdP below fails to create if the credentials
+  # are not already valid. The URI is deterministic, so it can be built by hand
+  # ahead of time -- see the README's ordering note.
+  BenchUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref BenchUserPool
+
+  BenchGoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref BenchUserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        # openid/email/profile are all non-sensitive scopes, so Google does not
+        # require an app verification review before publishing the consent
+        # screen. Adding a sensitive scope later changes that.
+        authorize_scopes: 'openid email profile'
+      AttributeMapping:
+        email: email
+        email_verified: email_verified
+        name: name
+        username: sub
+
+  # DependsOn is load-bearing, not decorative: SupportedIdentityProviders is
+  # validated against the providers that already exist on the pool, so without
+  # it CloudFormation races and the deploy fails with an unhelpful
+  # "identity provider Google does not exist" error.
+  BenchUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: BenchGoogleIdentityProvider
+    Properties:
+      UserPoolId: !Ref BenchUserPool
+      ClientName: bench-web
+      # Public SPA client: no secret, because anything shipped in the JS bundle
+      # is readable. The authorization-code flow with PKCE is what makes that
+      # safe. This is the same reasoning that made the old shared token not a
+      # secret -- the difference is that this one is not pretending otherwise.
+      GenerateSecret: false
+      SupportedIdentityProviders:
+        - Google
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs: !Ref CallbackUrls
+      LogoutURLs: !Ref LogoutUrls
+      PreventUserExistenceErrors: ENABLED
+
+  # The Identity Pool is the point of the project: it exchanges the User Pool
+  # token for real AWS credentials, so authorization is an IAM role evaluated by
+  # AWS rather than an if-statement in the handler.
+  BenchIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: bench_identity_pool
+      # No unauthenticated identities. There is no guest tier, and an
+      # unauthenticated role would be a second principal to keep away from
+      # Bedrock.
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref BenchUserPoolClient
+          ProviderName: !GetAtt BenchUserPool.ProviderName
+          # Checks with the User Pool that the token has not been revoked,
+          # rather than trusting it until expiry.
+          ServerSideTokenCheck: true
+
+  # The whole authorization model, in one policy.
+  #
+  # lambda:InvokeFunctionUrl and nothing else. NOT bedrock:InvokeModel -- see
+  # the header comment. If this policy ever grows a Bedrock action, the role
+  # must also be added to the Roles: list of BenchBudgetAction in
+  # bench-extract/template.yaml, or the enforcement budget stops being able to
+  # stop anything.
+  BenchAuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Role assumed by signed-in Bench users via the Identity Pool.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref BenchIdentityPool
+              # Without this, credentials issued to an UNauthenticated identity
+              # could assume the role. Belt and braces given
+              # AllowUnauthenticatedIdentities is already false.
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: invoke-bench-extract-function-url
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunctionUrl
+                Resource: !Ref BenchExtractFunctionArn
+                Condition:
+                  StringEquals:
+                    # Scopes the grant to the IAM-authenticated URL. If the
+                    # Function URL is ever set back to AuthType: NONE, this
+                    # condition stops matching and the grant quietly does
+                    # nothing, rather than silently continuing to work.
+                    'lambda:FunctionUrlAuthType': AWS_IAM
+
+  BenchIdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref BenchIdentityPool
+      Roles:
+        authenticated: !GetAtt BenchAuthenticatedRole.Arn
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID.
+    Value: !Ref BenchUserPool
+
+  UserPoolClientId:
+    Description: App client ID. Needed by the frontend in Phase 3.
+    Value: !Ref BenchUserPoolClient
+
+  IdentityPoolId:
+    Description: Identity Pool ID. Needed by the frontend in Phase 3.
+    Value: !Ref BenchIdentityPool
+
+  HostedUiDomain:
+    Description: Hosted-UI base URL for the sign-in redirect.
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+
+  GoogleRedirectUri:
+    Description: >
+      Register this exact value as an Authorized redirect URI in Google Cloud
+      Console. It must exist there BEFORE the first deploy of this stack.
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/idpresponse'
+
+  AuthenticatedRoleArn:
+    Description: Role signed-in users assume. Scoped to InvokeFunctionUrl only.
+    Value: !GetAtt BenchAuthenticatedRole.Arn
