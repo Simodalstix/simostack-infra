@@ -151,7 +151,10 @@ the number is still interesting rather than alarming.
 ### Fail closed, recover by hand
 
 Neither circuit breaker self-heals, deliberately. If one fired, something was
-wrong and a human should find out what before the endpoint is live again.
+wrong and a human should find out what before the endpoint is live again. The
+alarm itself does return to `OK` on its own once the metric subsides, and its
+`OKActions` are empty, so recovery restores nothing; only a human restoring
+reserved concurrency reopens the endpoint. Verified by drill on 2026-08-22.
 
 The recovery commands are in the
 [Lambda README](./bench-extract/README.md#incident-recovery), along with
@@ -184,6 +187,12 @@ Stated plainly so it is not mistaken for done:
   It filters bots; it does not stop a person who reads the bundle.
 - **No per-caller rate limiting.** Concurrency is global, not per-IP. A single
   abusive caller and normal use are indistinguishable to it.
+- **A passing kill-switch drill does not prove the alarm fires at the right
+  time.** The drill (last passed 2026-08-22) forces the transition with
+  `set-alarm-state`, so everything from `ALARM` onward is verified end to end
+  while the `Invocations` metric, the `FunctionName` dimension, the 300-second
+  period and the threshold of 100 are still taken on trust. Only real traffic
+  exercises those.
 - **No log retention or failure alerting configured.** You will find out about
   extraction failures from the UI, not from CloudWatch.
 - **The budget is account-wide for the Bedrock service**, not scoped to this

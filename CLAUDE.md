@@ -123,7 +123,8 @@ rather than replacing the lint one.
   silently resets concurrency and reopens the endpoint.
 - The real Bedrock path has been exercised in production (invocations logged
   2026-08-08/09, 1.3-2.7s, no Bedrock errors). The alarm → SNS → kill-switch
-  chain has **not**: the alarm has only ever gone `INSUFFICIENT_DATA` → `OK`.
+  chain has now been exercised as well: the drill passed on **2026-08-22**, both
+  halves. See "Kill-switch drill" below for what that does and does not prove.
 
 ## History
 
@@ -215,14 +216,34 @@ sign up and spend the Bedrock budget. That is accepted, but it makes
    authentication" closes; "open sign-up means anyone can spend the budget"
    opens in its place.
 
-### Untested infrastructure
+### Kill-switch drill (last passed 2026-08-22)
 
-The alarm → SNS → kill-switch chain has never fired. `SECURITY.md` claims it
-works. Before opening sign-up, run the "Testing the kill switch" drill in
-`bench-extract/README.md`: assert the email subscription's
-`ConfirmationWasAuthenticated: true` rather than just its row, force the
-alarm with `aws cloudwatch set-alarm-state`, then check **both** halves, reserved
-concurrency at 0 and the email actually arriving. Do not invoke the kill-switch
-Lambda directly. It publishes nothing, so that tests the concurrency half and
-silently skips the notification half, which is the failure this drill exists to
-catch. This is a live-resource change, so ask first.
+The alarm → SNS → kill-switch chain **has** now fired, under the "Testing the
+kill switch" drill in `bench-extract/README.md`. Both halves passed: reserved
+concurrency went to 0, and the email arrived. **This was the stated gate on
+opening sign-up, and it is now cleared.** Recorded so the next reader does not
+re-derive it:
+
+- Forced `OK` → `ALARM` at 07:27:44Z; SNS fanned out to both subscribers; the
+  kill-switch Lambda ran in 870ms and zeroed concurrency.
+- The alarm self-cleared to `OK` at 07:28:47Z, 63 seconds later, on the missing
+  datapoint being treated as `NonBreaching`. It does not sit latched, so the next
+  real trip still has a transition to fire on. `OKActions` is `[]`, so recovery
+  fires nothing.
+- Reserved concurrency was restored to 1 by hand. Total outage: 48 seconds.
+
+**What this does not prove:** the drill forces the transition with
+`set-alarm-state`, so everything from `ALARM` onward is verified while the
+`Invocations` metric, the `FunctionName` dimension, the 300-second period and the
+threshold of 100 are still taken on trust. The honest claim is "the chain fires
+correctly once the alarm fires", not "the alarm fires at the right time".
+
+**Re-run it quarterly** (next due **2026-11-22**), and off-cycle after any deploy
+that recreates the SNS topic or changes the alarm, since a recreated topic starts
+with an unconfirmed email subscription on a three-day fuse.
+
+When re-running: assert the email subscription's `ConfirmationWasAuthenticated:
+true` rather than just its row, and check **both** halves. Do not invoke the
+kill-switch Lambda directly. It publishes nothing, so that tests the concurrency
+half and silently skips the notification half, which is the failure this drill
+exists to catch. This is a live-resource change and a real outage, so ask first.

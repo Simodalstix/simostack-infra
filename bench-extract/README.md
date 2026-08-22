@@ -456,11 +456,15 @@ role `sam-app-BenchExtractFunctionRole-JkOIOYE75BYa` and policy
 
 ## Testing the kill switch
 
-The chain has never fired in anger, so until this drill is run the only evidence
-it works is that the template reads correctly. Run it before relying on the
-breaker, and again after any deploy that recreates the SNS topic, because a
-recreated topic starts with an unconfirmed email subscription and a three-day
-fuse on it.
+**Last run 2026-08-22: passed, both halves.** Reserved concurrency went to 0 and
+the email arrived; the alarm self-cleared to `OK` 63 seconds later and the
+endpoint was restored by hand, for a 48-second outage. Details and the residual
+gap are in "What the drill still does not cover" below.
+
+Re-run it **quarterly** (next due **2026-11-22**), and off-cycle whenever the
+alarm or the SNS topic changes, because a recreated topic starts with an
+unconfirmed email subscription and a three-day fuse on it. The drill is the only
+evidence the breaker works; without it the template merely reads correctly.
 
 **1. Assert the email subscription is confirmed and protected.** This is a
 precondition, not a formality: the notification half is the half that silently
@@ -565,12 +569,10 @@ fires at the right time".
 
 ## Not yet done
 
-- The alarm → SNS → kill-switch chain has not been exercised end to end. The
-  drill is written up under "Testing the kill switch" above. Its precondition,
-  a confirmed email subscription, is now met, so nothing blocks running it.
-- The budget-action reverse procedure above is written but, like the kill switch,
-  has never been run. It is derived from the template and the Budgets API, not
-  from an observed trip.
+- The budget-action reverse procedure above is written but has never been run.
+  It is derived from the template and the Budgets API, not from an observed
+  trip. The kill-switch chain no longer belongs on this list; see "Testing the
+  kill switch" above.
 - `BudgetMonthlyLimitUsd` is account-wide for Bedrock rather than scoped to this
   function. A second Bedrock workload on this account is the trigger to revisit
   the number and probably split the budget.
