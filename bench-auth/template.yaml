@@ -109,9 +109,12 @@ Resources:
           RequireNumbers: true
           RequireSymbols: true
       MfaConfiguration: 'OFF'
-      # INACTIVE while this is being stood up and may need tearing down and
-      # redeploying. Flip to ACTIVE once real users exist -- deleting a user
-      # pool deletes its users, and they are not recoverable.
+      # INACTIVE deliberately, and correct for Phases 1 and 2: this stack may
+      # still need tearing down and redeploying, and the only accounts in the
+      # pool are test ones. Flipping it to ACTIVE is an entry gate on Phase 3 --
+      # it must be deployed before the login UI ships in vue-simostack, because
+      # that is the moment the pool starts holding real users, and deleting a
+      # user pool deletes its users unrecoverably. See README, "Phases".
       DeletionProtection: INACTIVE
 
   # Hosted-UI domain. The redirect URI registered in Google Cloud Console is
@@ -171,6 +174,15 @@ Resources:
       CallbackURLs: !Ref CallbackUrls
       LogoutURLs: !Ref LogoutUrls
       PreventUserExistenceErrors: ENABLED
+      # Refresh only. Omitting ExplicitAuthFlows does not mean "no direct auth":
+      # Cognito defaults the client to ALLOW_USER_SRP_AUTH and
+      # ALLOW_CUSTOM_AUTH as well, which leaves an InitiateAuth password path
+      # open against a pool whose users are supposed to arrive only through
+      # Google. Nothing here needs it -- the hosted-UI code exchange happens at
+      # the /oauth2/token endpoint and is not an ExplicitAuthFlow -- so the only
+      # flow the app actually uses is the one that renews an existing session.
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
 
   # The Identity Pool is the point of the project: it exchanges the User Pool
   # token for real AWS credentials, so authorization is an IAM role evaluated by
@@ -231,6 +243,27 @@ Resources:
                     # condition stops matching and the grant quietly does
                     # nothing, rather than silently continuing to work.
                     'lambda:FunctionUrlAuthType': AWS_IAM
+
+        # Belt and braces on the constraint in the header comment. The Allow
+        # above grants lambda:InvokeFunctionUrl and nothing else, so this Deny
+        # changes no behaviour today. It is here because an explicit Deny cannot
+        # be overridden by any later Allow, from this template or from a policy
+        # attached out of band: a change that grants this role Bedrock access
+        # fails closed instead of quietly working.
+        #
+        # Which makes removing it a two-part change, never a one-line one. If
+        # this role is ever genuinely meant to call Bedrock, the same change
+        # must add it to the Roles: list of BenchBudgetAction in
+        # ../bench-extract/template.yaml. Delete the Deny on its own and spend
+        # routes around the enforcement budget: it still notices the spend and
+        # no longer stops it.
+        - PolicyName: never-bedrock
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action: 'bedrock:*'
+                Resource: '*'
 
   BenchIdentityPoolRoleAttachment:
     Type: AWS::Cognito::IdentityPoolRoleAttachment

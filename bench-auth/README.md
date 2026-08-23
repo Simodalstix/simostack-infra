@@ -82,8 +82,22 @@ boundary rather than a placeholder.
    identity from `requestContext.authorizer.iam.cognitoIdentity`, concurrency to
    2. A Function URL cannot serve both auth modes at once, so there is a
    breakage window between this and Phase 3.
+   - [ ] **Confirm the cutover actually closed the URL**, both halves: inspect
+     the changeset for the `AWS::Lambda::Permission` resource *before*
+     executing it (the `AuthType: NONE` URL has one granting
+     `lambda:InvokeFunctionUrl` to `Principal: *`, and it must show up as
+     replaced rather than left in place), and after the deploy an unsigned
+     `curl` of the Function URL must return `403`. Changing `AuthType` on the
+     URL and leaving that permission behind reads as a successful cutover while
+     the endpoint is still open to anyone.
 3. **vue-simostack**: login UI, SigV4 signing on the call, retire
    `VITE_BENCH_ACCESS_TOKEN`.
+   - [ ] **Entry gate:** flip `DeletionProtection` on the User Pool from
+     `INACTIVE` to `ACTIVE` and deploy that change *before* the login UI ships.
+     `INACTIVE` is the right setting through Phases 1 and 2, while the pool
+     holds only test accounts and may need tearing down; shipping the login UI
+     is the moment it starts holding real users, and deleting a user pool
+     deletes its users unrecoverably.
 4. **Recalibrate and update `SECURITY.md`**: "the shared token is not
    authentication" closes as a gap; "open sign-up means anyone can spend the
    budget" opens in its place.
@@ -197,8 +211,10 @@ before this goes to production.
 - The `UserPoolClientId`, `IdentityPoolId` and `HostedUiDomain` outputs are what
   Phase 3 needs in `vue-simostack`. Nothing carries them across automatically,
   the same as the Function URL handoff.
-- Flip `DeletionProtection` on the User Pool to `ACTIVE` once real users exist.
-  Deleting a user pool deletes its users and they are not recoverable.
+- Leave `DeletionProtection` on the User Pool at `INACTIVE`. That is correct for
+  Phases 1 and 2, when the pool holds only test accounts; flipping it to
+  `ACTIVE` is an entry gate on Phase 3 (see "Phases" above), not a step to do
+  here.
 
 ## Not yet done
 
