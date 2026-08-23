@@ -210,9 +210,11 @@ sign up and spend the Bedrock budget. That is accepted, but it makes
    identity from `requestContext.authorizer.iam.cognitoIdentity`; concurrency to
    2. A Function URL cannot serve both auth modes at once, so there is a
    breakage window between this and Phase 3. Two checks are part of the phase,
-   not optional extras: the changeset must show the `AWS::Lambda::Permission`
-   from the `AuthType: NONE` URL (`Principal: *`) being replaced, and after the
-   deploy an unsigned call to the Function URL must return 403.
+   not optional extras: the changeset must show **both** `Principal: "*"`
+   permissions on the function going away (there are two live today, the
+   `InvokeFunctionUrl`/`AuthType: NONE` one and the
+   `InvokeFunction`/`InvokedViaFunctionUrl` one), and after the deploy an
+   unsigned call to the Function URL must return 403.
 3. **vue-simostack**: login UI, SigV4 signing on the call, retire
    `VITE_BENCH_ACCESS_TOKEN`. **Entry gate:** the User Pool's
    `DeletionProtection` goes `INACTIVE` → `ACTIVE`, deployed, before the login

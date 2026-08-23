@@ -83,13 +83,20 @@ boundary rather than a placeholder.
    2. A Function URL cannot serve both auth modes at once, so there is a
    breakage window between this and Phase 3.
    - [ ] **Confirm the cutover actually closed the URL**, both halves: inspect
-     the changeset for the `AWS::Lambda::Permission` resource *before*
-     executing it (the `AuthType: NONE` URL has one granting
-     `lambda:InvokeFunctionUrl` to `Principal: *`, and it must show up as
-     replaced rather than left in place), and after the deploy an unsigned
-     `curl` of the Function URL must return `403`. Changing `AuthType` on the
-     URL and leaving that permission behind reads as a successful cutover while
-     the endpoint is still open to anyone.
+     the changeset for the `AWS::Lambda::Permission` resources *before*
+     executing it, and after the deploy an unsigned `curl` of the Function URL
+     must return `403`. Changing `AuthType` and leaving a permission behind
+     reads as a successful cutover while the endpoint is still open to anyone.
+
+     Note there are **two** `Principal: "*"` statements on the live function
+     policy today, not one (verified 2026-08-23 via `aws lambda get-policy`);
+     both must be gone afterwards:
+     - `...BenchExtractFunctionUrlPublicPermissions...` --
+       `lambda:InvokeFunctionUrl`, conditioned on
+       `lambda:FunctionUrlAuthType: NONE`.
+     - `...BenchExtractFunctionURLInvokeAllowPublicAccess...` --
+       `lambda:InvokeFunction`, conditioned on
+       `lambda:InvokedViaFunctionUrl: true`.
 3. **vue-simostack**: login UI, SigV4 signing on the call, retire
    `VITE_BENCH_ACCESS_TOKEN`.
    - [ ] **Entry gate:** flip `DeletionProtection` on the User Pool from
