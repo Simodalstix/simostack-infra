@@ -149,6 +149,11 @@ rather than replacing the lint one.
 
 ### Phase 1 verification (2026-08-27)
 
+`bench-auth/verify-e2e.sh` is the check, and it resolves every id from stack
+outputs rather than hardcoding them. Its step 5 is phase-aware: it reads the
+live Function URL `AuthType` and asserts the posture that phase requires, so it
+is also the Phase 2 cutover check and needs no editing at that deploy.
+
 Run end-to-end against real resources with a real Google sign-in, not simulated.
 What it established:
 

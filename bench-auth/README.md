@@ -4,9 +4,10 @@ Cognito authentication for Bench: a User Pool with Google federation, an
 Identity Pool, and an authenticated IAM role scoped to invoking the
 bench-extract Function URL.
 
-**Phase 1 is authored but nothing is deployed.** No AWS resources exist for this
-stack. `template.yaml` has passed `cfn-lint` and `sam validate --lint`, which
-confirms it is well-formed, not that it deploys cleanly.
+**Phase 1 is deployed** (2026-08-25) **and verified end-to-end** (2026-08-27),
+as the stack `bench-auth` in `ap-southeast-2`. Phases 2, 3 and 4 have not
+started. See "Verifying" below for what the verification does and does not
+cover.
 
 ## What this replaces
 
@@ -76,7 +77,8 @@ boundary rather than a placeholder.
 ## Phases
 
 1. **bench-auth standalone**: everything in this directory. Deploys and
-   verifies without touching bench-extract. *Authored, not deployed.*
+   verifies without touching bench-extract. *Deployed 2026-08-25, verified
+   2026-08-27 with `verify-e2e.sh`.*
 2. **bench-extract cutover**: `AuthType: AWS_IAM`, drop the token check,
    `Cors.AllowHeaders` loses `x-bench-token` and gains the SigV4 headers, read
    identity from `requestContext.authorizer.iam.cognitoIdentity`, concurrency to
@@ -210,11 +212,8 @@ before this goes to production.
 
 - Confirm the stack's `GoogleRedirectUri` output matches what was registered in
   Google Cloud Console exactly.
-- Sign in once through the hosted UI to confirm a user is created in the pool
-  and that the Identity Pool issues credentials.
-- Confirm the credentials can invoke the bench-extract Function URL and **cannot**
-  call Bedrock directly. The second half is the one worth actually testing: an
-  `aws bedrock invoke-model` with those credentials should return `AccessDenied`.
+- Run `bash bench-auth/verify-e2e.sh`. It does the sign-in, the Identity Pool
+  exchange and the Bedrock deny check in one pass. See "Verifying" below.
 - The `UserPoolClientId`, `IdentityPoolId` and `HostedUiDomain` outputs are what
   Phase 3 needs in `vue-simostack`. Nothing carries them across automatically,
   the same as the Function URL handoff.
@@ -223,13 +222,56 @@ before this goes to production.
   `ACTIVE` is an entry gate on Phase 3 (see "Phases" above), not a step to do
   here.
 
+## Verifying
+
+`verify-e2e.sh` is the check. Run it from the repo root:
+
+```bash
+bash bench-auth/verify-e2e.sh
+```
+
+It resolves every id from the stack's outputs, so there is nothing to edit and
+no account id baked into it. It prints a hosted-UI URL, waits while you sign in
+with Google, and takes the `?code=` from the address bar of the dead-port
+redirect. Then it exchanges the code, gets Identity Pool credentials, and runs
+the assertions.
+
+Two things about it are load-bearing:
+
+- **The probes run with `AWS_PROFILE` scrubbed.** Your admin credentials would
+  otherwise satisfy a Bedrock call and the deny check would pass while proving
+  nothing.
+- **`invoke-model` passes `--cli-binary-format raw-in-base64-out`.** Without it
+  the AWS CLI v2 rejects the JSON body locally, no request reaches Bedrock, and
+  the check again passes vacuously. That bug shipped once already.
+
+**Step 5 is phase-aware and needs no editing at cutover.** It reads the live
+`AuthType` off the Function URL and asserts what that phase requires:
+
+| `AuthType` | Phase | Unsigned call | Signed call |
+| --- | --- | --- | --- |
+| `NONE` | 1 | reaches the function | denied, the grant requires `AWS_IAM` |
+| `AWS_IAM` | 2 | **403** | authenticates |
+
+Under `NONE`, a denied signed call is correct, not a regression. The `AWS_IAM`
+row is the pair of cutover gates from the Phases section, so re-run this
+straight after the Phase 2 deploy.
+
+Re-running always needs a browser: the client's `ExplicitAuthFlows` is
+`ALLOW_REFRESH_TOKEN_AUTH` alone, with no password flow, so a federated user's
+credentials cannot be obtained headlessly.
+
+Note that under `AuthType: NONE` the unsigned probe is a real invocation and
+costs a real Bedrock call.
+
 ## Not yet done
 
-- Nothing is deployed; no AWS resources exist for this stack.
-- The Google Cloud Console prerequisites above have not been carried out.
-- `cfn-lint` and `sam validate --lint` pass, which is static validation only.
-  The stack has never been deployed, so nothing confirms the resources actually
-  create. Cognito's cross-resource validation (IdP names, callback URL formats,
-  domain-prefix uniqueness) mostly fails at deploy time, not lint time.
+- Phase 1 is deployed and verified end-to-end. Phases 2, 3 and 4 have not
+  started.
+- `bedrock:InvokeModel` has been proven denied by `simulate-principal-policy`,
+  not by an observed live refusal; `bedrock:ListFoundationModels` was denied
+  live under real credentials, and both are the same `Deny bedrock:*` statement.
+  A clean run of `verify-e2e.sh` closes this, since the base64 bug that caused
+  it is fixed.
 - Whether the Google client secret can live in SSM as a `SecureString` is
   unverified. See above.
