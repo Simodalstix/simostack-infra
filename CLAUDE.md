@@ -77,11 +77,17 @@ a repo-wide test job would have to know every service directory or force a root
 workspace.
 
 `.github/workflows/bench-auth-tests.yml` is the same shape, path-filtered to
-`bench-auth/**`, but it lints CloudFormation instead of running unit tests.
-bench-auth is IaC only with no JavaScript, so there is no `package.json` and
-nothing for vitest to run; `cfn-lint` is the equivalent check. If bench-auth
-ever grows Lambda code (a pre-sign-up trigger, say), add a `npm test` step
-rather than replacing the lint one.
+`bench-auth/**`, but it lints instead of running unit tests. bench-auth has no
+JavaScript, so there is no `package.json` and nothing for vitest to run. It
+runs two linters: `cfn-lint` on `template.yaml` and `shellcheck` on
+`verify-e2e.sh`. Steps here are **added, not swapped** -- if bench-auth ever
+grows Lambda code (a pre-sign-up trigger, say), add a `npm test` step beside
+these rather than replacing one.
+
+`verify-e2e.sh` cannot run in CI: it needs live credentials and a human
+completing a Google sign-in. `shellcheck` is the only automated check it gets,
+and it catches quoting and unset-variable bugs, not the "check passes while
+proving nothing" class that actually bit during Phase 1 verification.
 
 ## Deployed state (bench-extract verified 2026-08-21, bench-auth 2026-08-27)
 

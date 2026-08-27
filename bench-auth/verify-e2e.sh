@@ -100,6 +100,7 @@ if [ -n "$FALLBACK" ] && [ "$REDIRECT" = "$FALLBACK" ]; then
   fi
 fi
 
+# shellcheck disable=SC2016  # backticks here are JMESPath literal-quoting, not a subshell
 MODEL_ID=$(aws cloudformation describe-stacks --stack-name "$EXTRACT_STACK" --region "$REGION" \
   --query 'Stacks[0].Parameters[?ParameterKey==`BedrockModelId`].ParameterValue' --output text 2>/dev/null)
 MODEL_ID=${MODEL_ID:-anthropic.claude-haiku-4-5-20251001-v1:0}

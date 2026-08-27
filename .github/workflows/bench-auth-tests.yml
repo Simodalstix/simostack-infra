@@ -46,3 +46,15 @@ jobs:
       # pure offline check -- it validates the template, it does not confirm
       # the stack would deploy.
       - run: cfn-lint template.yaml
+
+      # Added alongside cfn-lint rather than replacing it, per the note above:
+      # this directory now holds shell as well as CloudFormation, and both need
+      # a check. shellcheck is preinstalled on the runner image, so there is
+      # nothing to install.
+      #
+      # This is static analysis too. verify-e2e.sh cannot run in CI at all: it
+      # needs live AWS credentials and a human completing a Google sign-in in a
+      # browser. shellcheck catches the quoting and unset-variable class of bug,
+      # not the "this check passes while proving nothing" class -- see the two
+      # commented guards in the script for what that looked like in practice.
+      - run: shellcheck verify-e2e.sh
