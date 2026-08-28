@@ -5,10 +5,15 @@ Transform: AWS::Serverless-2016-10-31
 # rationale lives here in comments instead, which cost nothing and are the
 # first thing a reader sees anyway.
 #
-# The Function URL has no AWS-level auth (AuthType: NONE) by design. CORS only
-# restricts *browser* callers, not direct HTTP requests, so a shared-secret
-# header (BenchAccessTokenParameterName), a fetch-target allowlist in index.mjs, and
-# ReservedConcurrentExecutions raise the bar against bots hitting it directly.
+# The Function URL requires AWS-level auth (AuthType: AWS_IAM). Every request
+# must be SigV4-signed by a principal holding lambda:InvokeFunctionUrl on this
+# function, and an unsigned one is refused by Lambda at 403 without ever
+# reaching the handler. The only principal granted that is the bench-auth
+# authenticated Identity Pool role, so callers are Google-federated Cognito
+# users and nobody else. CORS is still declared but is no longer load-bearing
+# for auth: it only ever restricted *browser* callers. The fetch-target
+# allowlist in index.mjs and ReservedConcurrentExecutions remain, bounding what
+# a signed-in caller can make the function do and how fast.
 # None of those is a hard spend cap on its own. Two circuit breakers are:
 #
 #   - BenchHighInvocationAlarm (fast, ~1-3 min): watches the Invocations
@@ -25,8 +30,8 @@ Description: >
   URL (or accepts pasted raw text) server-side, strips it to readable text,
   and asks Claude Haiku (via Bedrock, IAM-authenticated: no Anthropic API key
   anywhere) for structured listing facts. No API Gateway, no VPC. The Function
-  URL is public by design and guarded by a shared-secret header, a fetch
-  allowlist, and two spend circuit breakers. See the comments above.
+  URL is closed to unsigned callers (AuthType: AWS_IAM) and further guarded by
+  a fetch allowlist and two spend circuit breakers. See the comments above.
   Reasoning and the deploy-time checklist live in the repo's SECURITY.md.
 
 Parameters:
@@ -49,12 +54,14 @@ Parameters:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /bench/access-token
     Description: >
-      Name of the SSM parameter holding the shared secret the frontend sends as
-      the x-bench-token header (VITE_BENCH_ACCESS_TOKEN). Not real
-      authentication, since anyone who reads the JS bundle can find it, but it
-      silently rejects opportunistic bots that scan for and hammer public
-      Lambda Function URLs, which is most of the real threat model for a
-      personal tool nobody is targeting. Seed it with e.g.
+      Name of the SSM parameter that held the shared secret the frontend sent
+      as the x-bench-token header (VITE_BENCH_ACCESS_TOKEN). VESTIGIAL SINCE
+      THE PHASE 2 CUTOVER: the handler no longer reads BENCH_ACCESS_TOKEN, and
+      IAM auth on the Function URL replaced it. Left wired on purpose, so a
+      rollback to the pre-cutover template is one deploy rather than a re-seed
+      of the SSM parameter, and it costs nothing to hold. Retire it in Phase 4
+      together with the environment variable and the parameter itself. Seed it
+      with e.g.
       `aws ssm put-parameter --name /bench/access-token --type String
       --value "$(openssl rand -hex 24)" --region ap-southeast-2`.
   BedrockModelId:
@@ -146,12 +153,14 @@ Resources:
       # Change either constant in index.mjs and revisit this number.
       Timeout: 30
       # Bounds the maximum concurrent (and therefore per-minute) request rate
-      # against the public Function URL. This limits how FAST spend can
-      # accumulate, not how MUCH total. The Budget/BudgetsAction below is
-      # what actually stops it. 1, not 2: this is a single-user tool, nobody
-      # is ever adding two listings at once, and halving concurrency halves
-      # the worst-case burn rate for zero practical cost.
-      ReservedConcurrentExecutions: 1
+      # against the Function URL. This limits how FAST spend can accumulate,
+      # not how MUCH total. The Budget/BudgetsAction below is what actually
+      # stops it. 2, raised from 1 at the Phase 2 cutover: sign-up is open to
+      # any Google account now, so two people extracting at once is a real
+      # case and at 1 the second one gets a 429. Not higher than 2: with no
+      # per-user quota, this and BenchHighInvocationAlarm are the only fast
+      # brakes on burn rate.
+      ReservedConcurrentExecutions: 2
       Environment:
         Variables:
           # Resolves to the parameter's VALUE, not its name: that is what the
@@ -177,7 +186,12 @@ Resources:
                 - !Sub 'arn:aws:bedrock:ap-southeast-2::foundation-model/${BedrockFoundationModelId}'
                 - !Sub 'arn:aws:bedrock:ap-southeast-4::foundation-model/${BedrockFoundationModelId}'
       FunctionUrlConfig:
-        AuthType: NONE
+        # AWS_IAM, not NONE. Flipping this value alone does not close the URL:
+        # SAM emits two Principal: "*" AWS::Lambda::Permission resources for a
+        # NONE URL, and both must show as removed in the changeset. A deploy
+        # that changes AuthType while leaving either behind reads as a
+        # successful cutover with the endpoint still open to anyone.
+        AuthType: AWS_IAM
         Cors:
           AllowOrigins:
             - https://simostack.com
@@ -190,9 +204,17 @@ Resources:
           # listing it fails the deploy rather than adding preflight support.
           AllowMethods:
             - POST
+          # SigV4 puts the signature in `authorization` and the rest of the
+          # signed material in x-amz-* headers, so a browser making a signed
+          # cross-origin POST needs every one of them allowed here or the
+          # preflight fails before the request is sent. x-bench-token is gone:
+          # the handler no longer reads it.
           AllowHeaders:
             - content-type
-            - x-bench-token
+            - authorization
+            - x-amz-date
+            - x-amz-security-token
+            - x-amz-content-sha256
           MaxAge: 300
 
   # Attached automatically to the function's execution role when the budget
@@ -302,14 +324,15 @@ Resources:
         - Protocol: email
           Endpoint: !Ref AlertEmail
 
-  # NOTE ON THE THRESHOLD: Invocations counts *every* request that reaches the
-  # function, including the sub-millisecond 401s from bots that don't have the
-  # token. Those are nearly free (they never reach Bedrock), so this alarm is
-  # a "traffic is abnormal" detector, not a spend meter. That is deliberate:
-  # abnormal traffic is the leading indicator, and the cost of a false trip is
-  # one manual command to turn the tool back on.
+  # NOTE ON THE THRESHOLD: Invocations counts every request that reaches the
+  # function. Since the Phase 2 cutover to AuthType: AWS_IAM that no longer
+  # includes bot traffic -- an unsigned request is refused by Lambda at 403 and
+  # is never an invocation at all -- so what this counts is now authenticated
+  # use almost exclusively. It stays a "traffic is abnormal" detector rather
+  # than a spend meter: abnormal traffic is the leading indicator, and the cost
+  # of a false trip is one manual command to turn the tool back on.
   #
-  # For scale: with ReservedConcurrentExecutions at 1 and a real extraction
+  # For scale: with ReservedConcurrentExecutions at 2 and a real extraction
   # taking several seconds, legitimate use cannot physically reach 100 calls
   # in 5 minutes. Crossing this line means something automated is hitting it.
   BenchHighInvocationAlarm:
