@@ -157,10 +157,27 @@ In `../bench-extract/index.mjs`:
 - [ ] Update the vitest tests that assert the 401 on a missing or wrong token.
       They will fail, and they should: that contract is being removed.
 
+In `template.yaml` (this directory -- the checklist originally missed this and
+the cutover failed its first verification because of it):
+
+- [ ] The authenticated role's `invoke-bench-extract-function-url` policy needs
+      **two** statements, not one: `lambda:InvokeFunctionUrl` conditioned on
+      `lambda:FunctionUrlAuthType: AWS_IAM`, **and** `lambda:InvokeFunction`
+      conditioned on `lambda:InvokedViaFunctionUrl: true`. Since October 2025 a
+      function URL requires the caller to hold both. Before the cutover this
+      role got away with the first alone, because bench-extract's resource-based
+      policy granted `lambda:InvokeFunction` to `Principal: "*"` for the
+      `AuthType: NONE` URL -- the very statement step C asserts is gone. Closing
+      the URL therefore removes a permission the role was silently relying on.
+- [ ] This is a **separate deploy of the `bench-auth` stack**, and there is no
+      `samconfig.toml` here, so parameters are passed on the command line and
+      `GoogleClientSecret` has to be supplied again (it is `NoEcho`, so it
+      cannot be read back off the deployed stack). See "Deploying" below.
+
 Then, before executing anything:
 
-- [ ] `sam build && sam deploy --no-execute-changeset`, and **read the
-      changeset**. Both `AWS::Lambda::Permission` resources from step A must
+- [ ] `sam build && sam deploy --no-execute-changeset` in `../bench-extract`,
+      and **read the changeset**. Both `AWS::Lambda::Permission` resources from step A must
       show as removed. Changing `AuthType` while leaving a permission behind
       reads as a successful cutover while the endpoint is still open to anyone.
 
@@ -173,6 +190,18 @@ Then, before executing anything:
 - [ ] `bash bench-auth/verify-e2e.sh`. Step 5 reads the live `AuthType` and
       switches to the `AWS_IAM` row by itself, so there is nothing to edit: it
       asserts the unsigned 403 and that a signed call authenticates.
+- [ ] Check CloudWatch for the `bench-extract invocation` log line, and that
+      `userPoolSub` in it is not null. The `<pool>:CognitoSignIn:<sub>` shape
+      the handler parses out of `amr` is taken from documentation, and this is
+      the first place it meets a real event.
+
+**Reading a 403 on the signed call:** Lambda answers a missing invoke
+permission with a bare 403, byte-identical to the one an unsigned request gets,
+so step 5 failing tells you the call was refused but not why. Do not conclude
+the cutover is wrong. `simulate-principal-policy` is not sufficient either: it
+evaluates identity policies only, cannot see the function's resource-based
+policy, and will report `allowed` for `lambda:InvokeFunctionUrl` while the call
+fails for want of `lambda:InvokeFunction`. Simulate **both** actions.
 
 From here until Phase 3 ships, the deployed frontend is broken: it still sends
 `x-bench-token` and now gets a 403 on every extraction. That is the accepted

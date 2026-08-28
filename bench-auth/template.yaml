@@ -229,6 +229,15 @@ Resources:
               'ForAnyValue:StringLike':
                 'cognito-identity.amazonaws.com:amr': authenticated
       Policies:
+        # TWO actions, not one. Since October 2025 a function URL requires the
+        # caller to hold BOTH lambda:InvokeFunctionUrl and lambda:InvokeFunction;
+        # either one alone gets a bare 403 that looks exactly like an unsigned
+        # request being refused. Before the Phase 2 cutover this role got away
+        # with InvokeFunctionUrl alone, because bench-extract's resource-based
+        # policy granted InvokeFunction to Principal: "*" for the AuthType: NONE
+        # URL. Deleting that public grant is the point of the cutover, so the
+        # missing half has to be granted here instead. Discovered the hard way:
+        # verify-e2e.sh step 5 failed its signed call after the cutover deploy.
         - PolicyName: invoke-bench-extract-function-url
           PolicyDocument:
             Version: '2012-10-17'
@@ -243,6 +252,16 @@ Resources:
                     # condition stops matching and the grant quietly does
                     # nothing, rather than silently continuing to work.
                     'lambda:FunctionUrlAuthType': AWS_IAM
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref BenchExtractFunctionArn
+                Condition:
+                  Bool:
+                    # Keeps this half as narrow as the other. Without the
+                    # condition the role could invoke the function through the
+                    # Lambda API directly, bypassing the URL entirely; with it,
+                    # the only way in is still the Function URL.
+                    'lambda:InvokedViaFunctionUrl': true
 
         # Belt and braces on the constraint in the header comment. The Allow
         # above grants lambda:InvokeFunctionUrl and nothing else, so this Deny
