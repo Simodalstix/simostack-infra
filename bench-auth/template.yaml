@@ -315,5 +315,10 @@ Outputs:
     Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/idpresponse'
 
   AuthenticatedRoleArn:
-    Description: Role signed-in users assume. Scoped to InvokeFunctionUrl only.
+    Description: >
+      Role signed-in users assume. Scoped to invoking bench-extract through its
+      Function URL and nothing else: lambda:InvokeFunctionUrl plus
+      lambda:InvokeFunction, the latter conditioned on
+      lambda:InvokedViaFunctionUrl so the Lambda API stays closed to it.
+      Bedrock is explicitly denied.
     Value: !GetAtt BenchAuthenticatedRole.Arn
