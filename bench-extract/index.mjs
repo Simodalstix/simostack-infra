@@ -12,10 +12,14 @@
 // official AWS SDK, a materially different supply-chain risk than a random
 // npm package.
 //
-// The Function URL itself has no AWS-level auth (see template.yaml). CORS
-// only stops browser callers, not bots hitting it directly, so every
-// request must carry the shared-secret x-bench-token header checked below,
-// and any URL it is asked to fetch must pass assertAllowedUrl. See
+// The Function URL is IAM-authenticated (AuthType: AWS_IAM, see
+// template.yaml): Lambda refuses an unsigned or unauthorized request with 403
+// before this handler runs, so there is no in-handler auth check and no
+// shared secret. The only principal granted lambda:InvokeFunctionUrl is the
+// bench-auth authenticated Identity Pool role, so every event arriving here
+// belongs to a signed-in Cognito user, recorded by readCallerIdentity below.
+// Any URL the caller asks for must still pass assertAllowedUrl: a signed-in
+// user is authenticated, not trusted with an open fetch proxy. See
 // ../../SECURITY.md for why each guardrail exists and what it does not cover.
 
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
@@ -25,7 +29,10 @@ import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-r
 // and is what the execution role is scoped to. Don't strip the `au.` prefix
 // here without widening the IAM policy in template.yaml to match.
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID
-const BENCH_ACCESS_TOKEN = process.env.BENCH_ACCESS_TOKEN
+// BENCH_ACCESS_TOKEN is still set by template.yaml but deliberately not read
+// here any more: IAM auth on the Function URL replaced the shared secret. The
+// environment variable stays wired until Phase 4 so a rollback to the
+// pre-cutover template is a single deploy.
 const MAX_PAGE_TEXT_CHARS = 15000
 const MAX_PAGE_BYTES = 2 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 8000
@@ -150,10 +157,20 @@ Never invent a value that isn't stated or directly computable from a stated
 value. Missing information is null, not a guess.`
 
 export const handler = async (event) => {
-  const providedToken = findHeader(event, 'x-bench-token')
-  if (!BENCH_ACCESS_TOKEN || providedToken !== BENCH_ACCESS_TOKEN) {
-    return jsonResponse(401, { error: 'Unauthorized' })
-  }
+  // No auth check here. Under AuthType: AWS_IAM an unsigned or unauthorized
+  // request is refused by Lambda at 403 and never reaches this line, so a
+  // check would be a 401 for legitimate callers rather than a second layer.
+  // Logging who called is the point instead: per-user quotas are deferred, so
+  // this line is what answers "who" when the invocation alarm fires, and it
+  // is what makes quotas addable later without a second cutover.
+  const caller = readCallerIdentity(event)
+  console.log(
+    JSON.stringify({
+      msg: 'bench-extract invocation',
+      identityId: caller.identityId,
+      userPoolSub: caller.userPoolSub,
+    }),
+  )
 
   let body
   try {
@@ -220,12 +237,28 @@ function parseBody(event) {
   return parsed
 }
 
-// Function URL events lowercase header names in practice, but that isn't a
-// documented guarantee, so check case-insensitively rather than trusting it.
-function findHeader(event, name) {
-  const headers = event.headers || {}
-  const key = Object.keys(headers).find((k) => k.toLowerCase() === name.toLowerCase())
-  return key ? headers[key] : undefined
+// Who signed this request, for the log line in the handler.
+//
+// Returning nulls is not an error path and must not throw: the request is
+// already authorized by IAM before it gets here, so failing it in JavaScript
+// would be re-deciding something Lambda has decided. A null pair means the
+// shape was not what we expected, and the log line says so rather than the
+// invocation dying.
+//
+// identityId is the Identity Pool identity (ap-southeast-2:<uuid>), stable per
+// user. The User Pool sub has no field of its own: it arrives inside the amr
+// array as "<user-pool-id>:CognitoSignIn:<sub>", alongside entries like
+// "authenticated" and the bare pool ARN, so it is matched on that marker
+// rather than taken by index.
+export function readCallerIdentity(event) {
+  const identity = event?.requestContext?.authorizer?.iam?.cognitoIdentity
+  if (!identity) return { identityId: null, userPoolSub: null }
+
+  const amr = Array.isArray(identity.amr) ? identity.amr : []
+  const signIn = amr.find((e) => typeof e === 'string' && e.includes(':CognitoSignIn:'))
+  const userPoolSub = signIn ? signIn.slice(signIn.lastIndexOf(':') + 1) || null : null
+
+  return { identityId: identity.identityId ?? null, userPoolSub }
 }
 
 // Throws a 400-flagged error (rather than the 502 an upstream failure gets)
