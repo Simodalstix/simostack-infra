@@ -84,21 +84,9 @@ boundary rather than a placeholder.
    identity from `requestContext.authorizer.iam.cognitoIdentity`, concurrency to
    2. A Function URL cannot serve both auth modes at once, so there is a
    breakage window between this and Phase 3.
-   - [ ] **Confirm the cutover actually closed the URL**, both halves: inspect
-     the changeset for the `AWS::Lambda::Permission` resources *before*
-     executing it, and after the deploy an unsigned `curl` of the Function URL
-     must return `403`. Changing `AuthType` and leaving a permission behind
-     reads as a successful cutover while the endpoint is still open to anyone.
-
-     Note there are **two** `Principal: "*"` statements on the live function
-     policy today, not one (verified 2026-08-23 via `aws lambda get-policy`);
-     both must be gone afterwards:
-     - `...BenchExtractFunctionUrlPublicPermissions...` --
-       `lambda:InvokeFunctionUrl`, conditioned on
-       `lambda:FunctionUrlAuthType: NONE`.
-     - `...BenchExtractFunctionURLInvokeAllowPublicAccess...` --
-       `lambda:InvokeFunction`, conditioned on
-       `lambda:InvokedViaFunctionUrl: true`.
+   - [ ] **Confirm the cutover actually closed the URL**, both halves: the
+     changeset before executing it, and an unsigned `curl` after. See
+     "Phase 2 checklist" below, which is the full step-by-step.
 3. **vue-simostack**: login UI, SigV4 signing on the call, retire
    `VITE_BENCH_ACCESS_TOKEN`.
    - [ ] **Entry gate:** flip `DeletionProtection` on the User Pool from
@@ -110,6 +98,100 @@ boundary rather than a placeholder.
 4. **Recalibrate and update `SECURITY.md`**: "the shared token is not
    authentication" closes as a gap; "open sign-up means anyone can spend the
    budget" opens in its place.
+
+## Phase 2 checklist
+
+Phase 2 edits `../bench-extract/`, not this directory, but it is bench-auth work
+and the checklist lives here. Steps are lettered so they can be referred to:
+A is read-only and can be run at any time, B is the change, C is what proves it.
+
+### A. Pre-deploy check
+
+Establish the before state, so the after state means something. All read-only.
+
+- [ ] The Function URL is still open:
+      `aws lambda get-function-url-config --function-name bench-extract
+      --region ap-southeast-2 --query AuthType` returns `NONE`.
+- [ ] **Both** `Principal: "*"` statements are on the function policy. There are
+      two today, not one (verified 2026-08-23 via `aws lambda get-policy`), and
+      step C asserts both are gone:
+      - `...BenchExtractFunctionUrlPublicPermissions...` --
+        `lambda:InvokeFunctionUrl`, conditioned on
+        `lambda:FunctionUrlAuthType: NONE`.
+      - `...BenchExtractFunctionURLInvokeAllowPublicAccess...` --
+        `lambda:InvokeFunction`, conditioned on
+        `lambda:InvokedViaFunctionUrl: true`.
+- [ ] `ReservedConcurrentExecutions` reads 1, matching the template. If it reads
+      0 the kill switch is tripped, and deploying is exactly the wrong move:
+      see the un-trip procedure in `../bench-extract/README.md`.
+- [ ] `bench-extract-high-invocations` is in `OK`, and its SNS email
+      subscription reports `ConfirmationWasAuthenticated: true` (the attribute,
+      not the row). Concurrency is about to double, and that alarm is the only
+      fast defence left once per-user quotas are deferred.
+
+### B. The deploy
+
+In `../bench-extract/template.yaml`:
+
+- [ ] `FunctionUrlConfig.AuthType`: `NONE` to `AWS_IAM`.
+- [ ] `Cors.AllowHeaders`: drop `x-bench-token`, add the SigV4 headers
+      (`authorization`, `x-amz-date`, `x-amz-security-token`,
+      `x-amz-content-sha256`). Keep `content-type`.
+- [ ] `ReservedConcurrentExecutions`: 1 to 2.
+- [ ] Update the header comment at the top of the file. It currently explains
+      `AuthType: NONE` as deliberate, which stops being true here.
+- [ ] Leave `BenchAccessTokenParameterName` and the `BENCH_ACCESS_TOKEN`
+      environment variable in place. See step D.
+
+In `../bench-extract/index.mjs`:
+
+- [ ] Drop the `x-bench-token` check at the top of the handler (~line 153).
+      With `AWS_IAM` the request never reaches the handler unsigned, so the
+      check is not a second layer, it is a 401 for every legitimate caller.
+- [ ] Read the caller from `event.requestContext.authorizer.iam.cognitoIdentity`
+      and log it on every invocation: `identityId` is the Identity Pool
+      identity, and the User Pool sub arrives in the `amr` array as
+      `<user-pool-id>:CognitoSignIn:<sub>`. This is the "log the sub" decision
+      above; it is what makes per-user quotas addable later without a second
+      cutover.
+- [ ] Update the vitest tests that assert the 401 on a missing or wrong token.
+      They will fail, and they should: that contract is being removed.
+
+Then, before executing anything:
+
+- [ ] `sam build && sam deploy --no-execute-changeset`, and **read the
+      changeset**. Both `AWS::Lambda::Permission` resources from step A must
+      show as removed. Changing `AuthType` while leaving a permission behind
+      reads as a successful cutover while the endpoint is still open to anyone.
+
+### C. Post-deploy verification
+
+- [ ] An unsigned `curl -si -X POST <function-url>` returns `403`. This is the
+      one check that cannot pass by reading configuration back to itself.
+- [ ] `aws lambda get-policy` returns neither `Principal: "*"` Sid.
+- [ ] `ReservedConcurrentExecutions` reads 2.
+- [ ] `bash bench-auth/verify-e2e.sh`. Step 5 reads the live `AuthType` and
+      switches to the `AWS_IAM` row by itself, so there is nothing to edit: it
+      asserts the unsigned 403 and that a signed call authenticates.
+
+From here until Phase 3 ships, the deployed frontend is broken: it still sends
+`x-bench-token` and now gets a 403 on every extraction. That is the accepted
+breakage window, not a regression.
+
+### D. What does not change in Phase 2: the access token
+
+- [ ] Leave the `/bench/access-token` SSM parameter, the
+      `BenchAccessTokenParameterName` template parameter and the
+      `BENCH_ACCESS_TOKEN` environment variable in place. The handler stops
+      reading the header, but leaving the parameter wired keeps a rollback to
+      the previous template a single deploy rather than a re-seed, and the
+      parameter costs nothing to hold.
+- [ ] Leave `VITE_BENCH_ACCESS_TOKEN` in `vue-simostack` alone. Phase 3 retires
+      it there, when the login UI replaces it.
+- [ ] **Retire in Phase 4**, not before: delete the template parameter, the
+      environment variable and the SSM parameter itself, and cut the access
+      token and rotation sections from `../bench-extract/README.md`, in the same
+      change that recalibrates `SECURITY.md`.
 
 ## By-hand prerequisites: Google Cloud Console
 
