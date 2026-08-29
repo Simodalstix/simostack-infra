@@ -172,9 +172,28 @@ sam deploy --guided
 
 Guided mode prompts for `BenchAccessTokenParameterName`, `BedrockModelId`,
 `BedrockFoundationModelId`, `BedrockRegion`, `BudgetMonthlyLimitUsd`,
-`EarlyWarningBudgetUsd` and `AlertEmail`. The two model parameters are the same
-string with and without the `au.` prefix: the profile the request names, and the
-underlying model IAM has to authorize it against. Change one, change both.
+`EarlyWarningBudgetUsd`, `AlertEmail`, `UserPoolId` and `UserPoolClientId`. The
+two model parameters are the same string with and without the `au.` prefix: the
+profile the request names, and the underlying model IAM has to authorize it
+against. Change one, change both.
+
+`UserPoolId` and `UserPoolClientId` identify the bench-auth Cognito pool whose
+id_tokens this function accepts, and they are the only two parameters with no
+default: a deploy that has not been told which pool to trust should fail at the
+prompt rather than come up trusting the wrong one. Read both from the
+`bench-auth` stack's outputs, don't type them from memory:
+
+```bash
+aws cloudformation describe-stacks --stack-name bench-auth \
+  --region ap-southeast-2 --output text \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'||OutputKey=='UserPoolClientId'].[OutputKey,OutputValue]"
+```
+
+They are deliberately copied rather than imported across stacks; the reasoning
+is in the template comment above the parameters. **Adding them to an existing
+deployment means hand-editing `parameter_overrides` in `samconfig.toml`, not
+re-running `--guided`**, which would overwrite every other real value with a
+default.
 
 `BenchAccessTokenParameterName` defaults to `/bench/access-token` and is the
 SSM parameter's **name**, not the token. Accept the default and CloudFormation
@@ -190,9 +209,12 @@ Two prompts are worth knowing about in advance:
   for you, so **you do not pass `--capabilities` on a guided deploy**. Only a
   bare `sam deploy` with no saved config needs `--capabilities CAPABILITY_IAM`
   spelled out.
-- **A warning that the Function URL has no authorization.** Expected:
-  `AuthType: NONE` is deliberate, and the `x-bench-token` check plus the
-  fetch allowlist are what stand in for it. Answer yes.
+- **A warning that the Function URL has no authorization.** This no longer
+  applies: since the Phase 2 cutover on 2026-08-29 the URL is `AuthType:
+  AWS_IAM` and SAM has nothing to warn about. If you ever see this prompt
+  again, the template has been reverted to `NONE` and the endpoint is about to
+  be reopened to anyone -- stop and check, rather than answering yes out of
+  habit.
 
 `CAPABILITY_IAM` is sufficient because neither IAM resource sets a custom name.
 If one ever gains a `RoleName` or `ManagedPolicyName`, CloudFormation starts

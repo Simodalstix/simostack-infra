@@ -7,8 +7,10 @@ design.
 ## Structure
 - `bench-extract/`: Bedrock-backed Lambda (listing extraction), SAM app. Built
   and deployed.
-- `bench-auth/`: Cognito auth for Bench. **Phase 1 is deployed** as the stack
-  `bench-auth` in `ap-southeast-2` (see below). Phases 2-4 are not started.
+- `bench-auth/`: Cognito auth for Bench. **Phases 1-2 are deployed and
+  verified** -- the stack `bench-auth` in `ap-southeast-2`, plus the
+  bench-extract cutover to `AuthType: AWS_IAM` (see below). Phases 3-4 are not
+  started, so the deployed frontend is still broken by design.
 - `SECURITY.md`: repo-wide threat model and guardrail rationale.
 - `README.md`: repo overview, deploy model, cross-repo handoff.
 - `.github/workflows/`: one test workflow per service.
@@ -89,7 +91,7 @@ completing a Google sign-in. `shellcheck` is the only automated check it gets,
 and it catches quoting and unset-variable bugs, not the "check passes while
 proving nothing" class that actually bit during Phase 1 verification.
 
-## Deployed state (bench-extract verified 2026-08-21, bench-auth 2026-08-27)
+## Deployed state (bench-extract verified 2026-08-29, bench-auth 2026-08-27)
 
 - The bench-extract stack is deployed in **`ap-southeast-2` under the stack name
   `sam-app`**, the `--guided` default, never changed. There is no stack named
@@ -174,9 +176,14 @@ What it established:
 - The first Cognito user now exists: `Google_101148087223423648620`,
   `EXTERNAL_PROVIDER`. Sign-up works; it is the pool's only user.
 
-`bedrock:InvokeModel` was **not** exercised live: the CLI rejected the request
-body client-side (AWS CLI v2 wants `--cli-binary-format raw-in-base64-out`), so
-no call reached Bedrock. `simulate-principal-policy` returns `explicitDeny` for
+`bedrock:InvokeModel` was **not** exercised live in the 2026-08-27 run: the CLI
+rejected the request body client-side (AWS CLI v2 wants
+`--cli-binary-format raw-in-base64-out`), so no call reached Bedrock. **That gap
+is closed as of the 2026-08-29 run**, which passed step 4 with the flag in place
+and the call genuinely refused by Bedrock, so the live claim now holds for
+`InvokeModel` as well as `ListFoundationModels`. The reasoning below is kept
+because it is why the script now fails loudly on a client-side rejection instead
+of counting it as a pass. `simulate-principal-policy` returns `explicitDeny` for
 `InvokeModel`, `InvokeModelWithResponseStream`, `Converse` and
 `CreateModelCustomizationJob`, against both the foundation-model ARN and the
 `au.*` inference-profile ARN the Lambda actually uses. That is the same `Deny
@@ -189,7 +196,60 @@ bench-extract when `lambda:FunctionUrlAuthType` is `AWS_IAM`, so the Phase 2
 cutover has the grant it needs. Today that call is denied in practice, because
 the Function URL is still `AuthType: NONE` and the grant's condition does not
 match. **A denied signed call to the Function URL is expected before Phase 2 and
-is not a regression.**
+is not a regression.** That sentence describes the world before 2026-08-29; the
+Function URL is now `AWS_IAM` and the signed call is the one that works.
+
+### Phase 2 cutover (deployed 2026-08-29)
+
+The auth half landed and is verified live:
+
+- `aws lambda get-function-url-config` reads `AuthType: AWS_IAM`.
+- `aws lambda get-policy` returns **no policy at all**, so both `Principal: "*"`
+  permissions are gone. That is the cutover gate met, not merely a changeset
+  that looked right.
+- An unsigned POST returns 403 and is not an invocation. A signed POST from the
+  bench-auth authenticated role reaches the handler.
+
+**The identity half shipped broken and was found the same day.** The handler
+read `requestContext.authorizer.iam.cognitoIdentity`, which Lambda documents as
+never populated on a Function URL, so the live log line read
+`{"identityId":null,"userPoolSub":null}` on a genuine authenticated call. The
+unit tests passed because they asserted against a hand-built API-Gateway-shaped
+event this endpoint cannot emit, and `verify-e2e.sh` passed 9/9 because nothing
+in it looked at the log line.
+
+**Fixed, deployed and verified the same day.** The handler reads the caller's
+id_token from the `x-bench-id-token` header and verifies it against the pool's
+JWKS (`aws-jwt-verify`), failing closed with a 401. `verify-e2e.sh` reported
+**12/12 on 2026-08-29**, with its new step 6 establishing all three of:
+
+- the logged `userPoolSub` is exactly the `sub` claim of the id_token that made
+  that call, correlated by `x-amzn-RequestId` rather than by recency;
+- a signed call carrying no `x-bench-id-token` returns 401, so the gate closes
+  rather than merely being present;
+- `sam-app`'s `UserPoolId` parameter still matches the pool `bench-auth`
+  deploys. A pool recreated on one side without the other is a total, silent
+  401 outage, and both stacks read as correctly configured on their own.
+
+The pool and client reach bench-extract as the plain template parameters
+`UserPoolId` and `UserPoolClientId`, set in `samconfig.toml`, deliberately not
+as a cross-stack `ImportValue`. **They have no defaults**: a deploy that has not
+been told which pool to trust fails at the prompt instead of coming up trusting
+the wrong one, so adding them to an existing deployment means hand-editing
+`parameter_overrides`, never re-running `--guided`.
+
+**Reading CloudWatch for that log line: quote the filter pattern.**
+
+```bash
+aws logs tail /aws/lambda/bench-extract --since 10m --region ap-southeast-2 \
+  --filter-pattern '"bench-extract invocation"'
+```
+
+Unquoted, `--filter-pattern 'bench-extract invocation'` matches **zero** events
+against a log group that plainly contains the line -- the hyphen is significant
+in an unquoted CloudWatch term. The failure is silent and reads exactly like
+"the handler never logged", which is how it nearly hid the defect above rather
+than exposing it.
 
 ## History
 
@@ -210,11 +270,13 @@ set as GitHub Actions secrets on `vue-simostack` and in its local `.env`
 error: the site calls the old one and every extraction fails as a network error
 that reads like a Lambda fault.
 
-## bench-auth (Phase 1 deployed and verified; Phases 2-4 not started)
+## bench-auth (Phases 1-2 deployed and verified; Phases 3-4 not started)
 
-Replaces the shared `x-bench-token` header (checked in
-`bench-extract/index.mjs`, ~line 153, against an SSM-sourced env var) with
-Cognito. That token ships in the public JS bundle and was never a secret.
+Replaced the shared `x-bench-token` header with Cognito. That token shipped in
+the public JS bundle and was never a secret. **The header check is gone from
+`bench-extract/index.mjs` as of the Phase 2 cutover on 2026-08-29**; the
+`BENCH_ACCESS_TOKEN` environment variable and its SSM parameter are still wired
+but unread, and Phase 4 retires them.
 
 Work through the design checklist in `SECURITY.md` before extending any of this.
 
@@ -259,7 +321,16 @@ considered and rejected for the reason above. Don't re-derive it.
   is: with no per-user quota, that global breaker is the only fast defence.
 - Log the Cognito sub on every invocation even though per-user quotas are
   deferred. It costs nothing, it tells you *who* when the alarm fires, and it
-  means quotas can be added later without a second cutover.
+  means quotas can be added later without a second cutover. The sub comes from
+  a verified id_token in `x-bench-id-token`, not from the IAM request context,
+  which cannot carry it over a Function URL (see Phase 2 below).
+- **Fail closed on attribution.** A request that IAM allows but that carries no
+  verifiable id_token gets a 401, before any fetch or Bedrock call. A null sub
+  is indistinguishable from a caller who left the header off, so a log line
+  that tolerates one cannot be trusted and a quota built on it could be opted
+  out of by anyone already holding the role. This is attribution, not a second
+  authorization layer, and it is not the `x-bench-token` shared secret
+  returning: the id_token is a short-lived RS256 JWT scoped to one user.
 
 **Consequence of open sign-up + global caps:** anyone with a Google account can
 sign up and spend the Bedrock budget. That is accepted, but it makes
@@ -272,17 +343,39 @@ sign up and spend the Bedrock budget. That is accepted, but it makes
    bench-extract. **Deployed 2026-08-25, verified end-to-end 2026-08-27** (see
    "Phase 1 verification" below).
 2. **bench-extract cutover**: `AuthType: AWS_IAM`; drop the token check;
-   `Cors.AllowHeaders` loses `x-bench-token` and gains the SigV4 headers; read
-   identity from `requestContext.authorizer.iam.cognitoIdentity`; concurrency to
-   2. A Function URL cannot serve both auth modes at once, so there is a
-   breakage window between this and Phase 3. Two checks are part of the phase,
-   not optional extras: the changeset must show **both** `Principal: "*"`
-   permissions on the function going away (there are two live today, the
-   `InvokeFunctionUrl`/`AuthType: NONE` one and the
-   `InvokeFunction`/`InvokedViaFunctionUrl` one), and after the deploy an
-   unsigned call to the Function URL must return 403.
+   `Cors.AllowHeaders` loses `x-bench-token` and gains the SigV4 headers plus
+   `x-bench-id-token`; verify the caller's Cognito id_token and log its `sub`;
+   concurrency to 2. A Function URL cannot serve both auth modes at once, so
+   there is a breakage window between this and Phase 3. Three checks are part
+   of the phase, not optional extras: the changeset must show **both**
+   `Principal: "*"` permissions on the function going away (there are two live
+   before the cutover, the `InvokeFunctionUrl`/`AuthType: NONE` one and the
+   `InvokeFunction`/`InvokedViaFunctionUrl` one), after the deploy an unsigned
+   call to the Function URL must return 403, and `verify-e2e.sh` step 6 must
+   read a real `userPoolSub` back out of the log line.
+
+   **Identity does not come from the IAM request context, and cannot.** The
+   first cut of this phase read
+   `requestContext.authorizer.iam.cognitoIdentity`; Lambda documents that field
+   as never populated on a Function URL ("Function URLs don't use this
+   parameter"), so it logged `null` on every invocation while its unit tests
+   stayed green. Cognito's enhanced flow also gives every user of the role the
+   same assumed-role session name, so `userArn` and `userId` are identical
+   across users and are no substitute. The caller sends its id_token in the
+   `x-bench-id-token` header instead and the handler verifies it against the
+   pool's JWKS with `aws-jwt-verify`. Don't re-derive this; it cost a deploy.
+
+   **Deployed and verified end-to-end 2026-08-29** (`verify-e2e.sh`, 12/12).
+   See "Phase 2 cutover" above.
 3. **vue-simostack**: login UI, SigV4 signing on the call, retire
-   `VITE_BENCH_ACCESS_TOKEN`. **Entry gate:** the User Pool's
+   `VITE_BENCH_ACCESS_TOKEN`. **Set `x-bench-id-token` before the request is
+   signed**, not in a fetch interceptor afterwards: set first, it lands in
+   `SignedHeaders` and the signature is bound to it; added after, it still
+   arrives and still verifies, but nothing ties it to that request. The
+   id_token is the same one already exchanged for the SigV4 credentials, so
+   take both from a single refresh rather than caching them separately --
+   pairing fresh credentials with a stale token is the failure mode.
+   **Entry gate:** the User Pool's
    `DeletionProtection` goes `INACTIVE` → `ACTIVE`, deployed, before the login
    UI ships. `INACTIVE` is correct through Phases 1-2; shipping login is when
    the pool starts holding real users.

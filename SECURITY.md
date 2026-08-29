@@ -176,6 +176,17 @@ deploy-time and account-level steps are in the Lambda README.
 - [ ] Separate low email-only budget, including a FORECASTED notification
 - [ ] IAM `Resource` scoped to the one model ARN, not `*`
 - [ ] Shared secret is `NoEcho` and not committed in `samconfig.toml`
+- [ ] If the endpoint needs to know *which* user is calling, work out where
+      that identity actually comes from before writing the code, and prove it
+      against a real invocation rather than a hand-built event. IAM
+      authorization and caller attribution are different questions, and an
+      endpoint can answer the first while being structurally unable to answer
+      the second: a Lambda Function URL under `AWS_IAM` never populates
+      `requestContext.authorizer.iam.cognitoIdentity`, and Cognito's enhanced
+      flow gives every user of a role the same assumed-role session name, so
+      `userArn` and `userId` do not distinguish them either. bench-extract
+      shipped a cutover reading that field, with green unit tests, and logged a
+      null user on every real call
 - [ ] Anyone given `cloudformation:DescribeChangeSet` on the stack is
       trusted with every SSM-sourced parameter in it (see below)
 
@@ -184,7 +195,19 @@ deploy-time and account-level steps are in the Lambda README.
 Stated plainly so it is not mistaken for done:
 
 - **The shared token is not authentication.** It ships in the public JS bundle.
-  It filters bots; it does not stop a person who reads the bundle.
+  It filters bots; it does not stop a person who reads the bundle. *Closing:
+  bench-extract's Function URL moved to `AuthType: AWS_IAM` on 2026-08-29 and
+  the handler no longer reads `x-bench-token`. Phase 4 of bench-auth rewrites
+  this entry; what replaces it is "open sign-up means anyone with a Google
+  account can spend the budget".*
+- **`x-bench-id-token` is not the shared token returning.** The handler does
+  verify a token again, so the resemblance is worth addressing directly: that
+  header carries a short-lived RS256 id_token minted by Cognito for one user
+  and verified against the pool's JWKS, and IAM still gates the endpoint
+  underneath it. It is attribution, not authorization -- an unsigned request is
+  refused at 403 before the handler runs, whatever the header says. The thing
+  that made `x-bench-token` not authentication was that one published string
+  admitted everybody; nothing here has that shape.
 - **No per-caller rate limiting.** Concurrency is global, not per-IP. A single
   abusive caller and normal use are indistinguishable to it.
 - **A passing kill-switch drill does not prove the alarm fires at the right
@@ -206,8 +229,9 @@ Stated plainly so it is not mistaken for done:
   policy that only restricts `ssm:GetParameter` is not a boundary. This is a
   property of the mechanism, not of any one parameter: it applies to every
   SSM-sourced parameter this stack ever takes, and it outlives
-  `BenchAccessToken`, which Phase 2 of bench-auth retires. Today the exposure is
-  nil, since that token ships in the public bundle anyway, and CI holds no AWS
-  credentials and makes no CloudFormation calls. Treat it as a constraint on who
+  `BenchAccessToken`, which bench-auth's Phase 2 cutover stopped reading and
+  Phase 4 retires outright. Today the exposure is nil, since that token ships
+  in the public bundle anyway, and CI holds no AWS credentials and makes no
+  CloudFormation calls. Treat it as a constraint on who
   gets `DescribeChangeSet`, and on pasting raw changeset output anywhere, rather
   than as a reason to avoid SSM.

@@ -8,7 +8,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@aws-sdk/client-bedrock-runtime": "^3.712.0"
+    "@aws-sdk/client-bedrock-runtime": "^3.712.0",
+    "aws-jwt-verify": "^5.2.1"
   },
   "devDependencies": {
     "vitest": "^4.1.10"

@@ -132,6 +132,34 @@ Parameters:
       sends a subscription-confirmation email per topic/budget after deploy,
       and each must be clicked once before notifications work.
 
+  # The bench-auth User Pool whose id_tokens this function will accept, and the
+  # client those tokens must be issued to. Together they are what the handler
+  # verifies x-bench-id-token against.
+  #
+  # Deliberately NOT a cross-stack ImportValue from the bench-auth stack. The
+  # two services are kept uncoupled on purpose (no root stack, separate deploy
+  # lifecycles), and an Export would make bench-auth's outputs unrenamable and
+  # the stack undeletable while this one refers to them. The price of that is a
+  # value copied by hand into samconfig.toml's parameter_overrides, which can
+  # drift if the pool is ever recreated. That failure is total and immediate --
+  # every call 401s -- and bench-auth/verify-e2e.sh asserts these still match
+  # the live bench-auth stack outputs rather than leaving it to be noticed.
+  #
+  # No Default on either, on purpose: a deploy that has not been told which
+  # pool to trust should fail at the prompt, not come up trusting the wrong one.
+  UserPoolId:
+    Type: String
+    Description: >
+      bench-auth Cognito User Pool ID, e.g. ap-southeast-2_xxxxxxxxx. Read it
+      from that stack's UserPoolId output; do not type it from memory. The
+      region prefix is what the handler derives the JWKS issuer URL from.
+  UserPoolClientId:
+    Type: String
+    Description: >
+      bench-auth User Pool client ID (the public, no-secret client the hosted
+      UI uses). Verified as the `aud` claim of every incoming id_token, so a
+      token minted for a different client of the same pool is refused.
+
 Resources:
   BenchExtractFunction:
     Type: AWS::Serverless::Function
@@ -168,6 +196,8 @@ Resources:
           BENCH_ACCESS_TOKEN: !Ref BenchAccessTokenParameterName
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           BEDROCK_REGION: !Ref BedrockRegion
+          USER_POOL_ID: !Ref UserPoolId
+          USER_POOL_CLIENT_ID: !Ref UserPoolClientId
       Policies:
         # Three ARNs, not one, because the call goes through an inference
         # profile: Bedrock authorizes it against the profile the request names
@@ -209,12 +239,21 @@ Resources:
           # cross-origin POST needs every one of them allowed here or the
           # preflight fails before the request is sent. x-bench-token is gone:
           # the handler no longer reads it.
+          #
+          # x-bench-id-token carries the caller's Cognito id_token, which is
+          # how the handler knows WHICH user this is; IAM cannot tell it over a
+          # Function URL. It is not a replacement shared secret -- see the
+          # header comment in index.mjs. The client must set it BEFORE signing
+          # so it lands in SignedHeaders and is bound to the request; a header
+          # added by a post-signing interceptor still arrives and still
+          # verifies, but is no longer covered by the signature.
           AllowHeaders:
             - content-type
             - authorization
             - x-amz-date
             - x-amz-security-token
             - x-amz-content-sha256
+            - x-bench-id-token
           MaxAge: 300
 
   # Attached automatically to the function's execution role when the budget

@@ -11,6 +11,8 @@
 #   4. those credentials CANNOT reach Bedrock -- the load-bearing constraint
 #      in CLAUDE.md, "the Lambda stays the only thing that calls Bedrock"
 #   5. the Function URL's auth posture matches the phase the repo is in
+#   6. the Lambda attributes that call to the right Cognito user, read back
+#      out of its own CloudWatch log line
 #
 # Step 5 is phase-aware and needs no editing at cutover. It reads the live
 # AuthType off the Function URL and asserts what that phase requires:
@@ -20,6 +22,13 @@
 #
 # The Phase 2 expectations are the two checks CLAUDE.md names as part of the
 # cutover, so run this immediately after that deploy.
+#
+# Step 6 exists because Phase 2 shipped with identity logging that never
+# worked: the handler read requestContext.authorizer.iam.cognitoIdentity, which
+# a Lambda Function URL documents as never populated, so every invocation
+# logged a null sub while the unit tests and every check in this script stayed
+# green. Configuration cannot catch that. Only reading the log line the real
+# invocation produced can, so that is what step 6 does.
 #
 # SIDE EFFECT: completing the sign-in creates a real Cognito user (yours) in
 # the pool, and under AuthType NONE the unsigned probe is a real invocation
@@ -158,10 +167,19 @@ python3 -c '
 import sys, json, base64
 t = sys.argv[1].split(".")[1]
 c = json.loads(base64.urlsafe_b64decode(t + "=" * (-len(t) % 4)))
-for k in ("iss", "aud", "email", "cognito:username"):
+for k in ("iss", "aud", "sub", "email", "cognito:username"):
     if k in c:
         print("    %s: %s" % (k, c[k]))
 ' "$ID_TOKEN"
+
+# The sub is the value the Lambda logs as userPoolSub. Step 6 compares against
+# exactly this, so a wrong-but-non-null sub fails rather than passing.
+TOKEN_SUB=$(python3 -c '
+import sys, json, base64
+t = sys.argv[1].split(".")[1]
+print(json.loads(base64.urlsafe_b64decode(t + "=" * (-len(t) % 4))).get("sub", ""))
+' "$ID_TOKEN")
+[ -n "$TOKEN_SUB" ] || bad "id_token carries no sub claim"
 
 step "2. Identity Pool exchange"
 LOGINS=$(python3 -c "import json,sys; print(json.dumps({'cognito-idp.$REGION.amazonaws.com/$POOL_ID': sys.argv[1]}))" "$ID_TOKEN")
@@ -228,18 +246,24 @@ case "$OUT" in
   *) bad "role can read the Lambda config; grant is wider than documented" ;;
 esac
 
-step "5. Function URL posture (AuthType: ${FURL_AUTH:-unknown})"
-if [ -z "$FURL" ]; then
-  meh "no Function URL on $FUNCTION_NAME; skipping"
-else
-  UNSIGNED=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$FURL" \
-    -H 'Content-Type: application/json' --data '{}' --max-time 30)
-  SIGNED=$(AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_SESSION_TOKEN="$ST" \
-    FURL="$FURL" REGION="$REGION" python3 - <<'PYSIGN'
-import datetime, hashlib, hmac, json, os, urllib.parse, urllib.request, urllib.error
+# One signed POST to the Function URL, printing "<http-status> <request-id>".
+#
+# $1 is the id_token to send in x-bench-id-token, or "" to send none. The
+# header is set BEFORE the request is signed, so it lands in SignedHeaders and
+# the signature covers it. That ordering is the requirement vue-simostack has
+# to meet in Phase 3: a header added by a post-signing fetch interceptor still
+# arrives and still verifies, but is no longer bound to the request.
+#
+# The request id is echoed so step 6 can find this exact invocation's log line
+# instead of trusting whatever the most recent one happens to be.
+signed_post() {
+  AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_SESSION_TOKEN="$ST" \
+  FURL="$FURL" REGION="$REGION" BENCH_ID_TOKEN="${1:-}" python3 - <<'PYSIGN'
+import datetime, hashlib, hmac, os, urllib.parse, urllib.request, urllib.error
 
 url = os.environ["FURL"]; region = os.environ["REGION"]
 ak, sk, st = os.environ["AWS_ACCESS_KEY_ID"], os.environ["AWS_SECRET_ACCESS_KEY"], os.environ["AWS_SESSION_TOKEN"]
+id_token = os.environ.get("BENCH_ID_TOKEN", "")
 p = urllib.parse.urlparse(url)
 host, path, service = p.netloc, p.path or "/", "lambda"
 body = b"{}"
@@ -250,6 +274,8 @@ payload_hash = hashlib.sha256(body).hexdigest()
 headers = {"content-type": "application/json", "host": host,
            "x-amz-content-sha256": payload_hash, "x-amz-date": amzdate,
            "x-amz-security-token": st}
+if id_token:
+    headers["x-bench-id-token"] = id_token
 signed = ";".join(sorted(headers))
 canon_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
 canon = f"POST\n{path}\n\n{canon_headers}\n{signed}\n{payload_hash}"
@@ -262,16 +288,33 @@ sig = hmac.new(k, sts_.encode(), hashlib.sha256).hexdigest()
 headers["authorization"] = (f"AWS4-HMAC-SHA256 Credential={ak}/{scope}, "
                             f"SignedHeaders={signed}, Signature={sig}")
 req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+def emit(status, hdrs):
+    # email.message.Message.get is case-insensitive, which matters: the header
+    # comes back as x-amzn-RequestId, not the lowercase form.
+    print("%s %s" % (status, hdrs.get("x-amzn-RequestId") or "-"))
+
 try:
     with urllib.request.urlopen(req, timeout=30) as r:
-        print(r.status)
+        emit(r.status, r.headers)
 except urllib.error.HTTPError as e:
-    print(e.code)
+    emit(e.code, e.headers)
 except Exception as e:
-    print(f"error:{e}")
+    print("error:%s -" % e)
 PYSIGN
-)
-  echo "    unsigned POST -> $UNSIGNED     signed POST -> $SIGNED"
+}
+
+step "5. Function URL posture (AuthType: ${FURL_AUTH:-unknown})"
+if [ -z "$FURL" ]; then
+  meh "no Function URL on $FUNCTION_NAME; skipping"
+else
+  UNSIGNED=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$FURL" \
+    -H 'Content-Type: application/json' --data '{}' --max-time 30)
+  # Bound the log search to this run. Taken before the call, not after, so a
+  # slow invocation cannot land outside its own window.
+  LOG_WINDOW_START=$(( ($(date -u +%s) - 60) * 1000 ))
+  read -r SIGNED SIGNED_REQID <<<"$(signed_post "$ID_TOKEN")"
+  echo "    unsigned POST -> $UNSIGNED     signed POST -> $SIGNED (request $SIGNED_REQID)"
 
   case "$FURL_AUTH" in
     NONE)
@@ -309,7 +352,90 @@ PYSIGN
   esac
 fi
 
-step "6. users after this run"
+step "6. caller identity, read back out of the log line"
+# Configuration cannot prove this one. The implementation Phase 2 shipped with
+# read the caller from requestContext.authorizer.iam.cognitoIdentity, a field
+# Lambda documents as never populated on a Function URL; it passed its unit
+# tests, passed step 5, and logged a null sub on every real invocation. So this
+# step asserts against the log line the invocation in step 5 actually wrote.
+if [ "$FURL_AUTH" != "AWS_IAM" ]; then
+  meh "AuthType is $FURL_AUTH; attribution is a Phase 2 property"
+else
+  # A user pool recreated in bench-auth without updating bench-extract's
+  # parameter is a total and silent outage: every call 401s while both stacks
+  # still read as correctly configured on their own. Cheap to rule out.
+  EXTRACT_POOL=$(aws cloudformation describe-stacks --stack-name "$EXTRACT_STACK" \
+    --region "$REGION" --output text \
+    --query "Stacks[0].Parameters[?ParameterKey=='UserPoolId'].ParameterValue" 2>/dev/null)
+  if [ "$EXTRACT_POOL" = "$POOL_ID" ]; then
+    ok "$EXTRACT_STACK trusts the pool bench-auth deploys ($POOL_ID)"
+  else
+    bad "$EXTRACT_STACK UserPoolId is '$EXTRACT_POOL'; bench-auth deploys '$POOL_ID'"
+    note "every signed call will 401 until these agree"
+  fi
+
+  if [ -z "$SIGNED_REQID" ] || [ "$SIGNED_REQID" = "-" ]; then
+    bad "the signed call returned no x-amzn-RequestId; cannot correlate a log line"
+  else
+    # Matched on the request id rather than "the newest line". A stale line
+    # from an earlier run would otherwise pass this silently, which is exactly
+    # the kind of false pass this step exists to close.
+    #
+    # The filter pattern is quoted ON PURPOSE. Unquoted, `bench-extract
+    # invocation` matches nothing at all -- the hyphen is significant in an
+    # unquoted CloudWatch term -- and an empty result reads as "the handler
+    # never logged" rather than "the pattern was wrong".
+    LOG_JSON=""
+    for _ in $(seq 1 15); do
+      LOG_JSON=$(aws logs filter-log-events \
+        --log-group-name "/aws/lambda/$FUNCTION_NAME" --region "$REGION" \
+        --start-time "$LOG_WINDOW_START" \
+        --filter-pattern '"bench-extract invocation"' \
+        --output json 2>/dev/null | python3 -c '
+import sys, json
+reqid = sys.argv[1]
+try:
+    events = json.load(sys.stdin).get("events", [])
+except Exception:
+    sys.exit(0)
+for e in events:
+    m = e.get("message", "")
+    if reqid in m and "{" in m:
+        print(m[m.index("{"):].strip())
+        break
+' "$SIGNED_REQID")
+      [ -n "$LOG_JSON" ] && break
+      sleep 2
+    done
+
+    if [ -z "$LOG_JSON" ]; then
+      bad "no invocation log line for request $SIGNED_REQID after 30s"
+    else
+      echo "    $LOG_JSON"
+      LOGGED_SUB=$(printf '%s' "$LOG_JSON" | python3 -c \
+        'import sys, json; print(json.load(sys.stdin).get("userPoolSub") or "")' 2>/dev/null)
+      if [ -z "$LOGGED_SUB" ]; then
+        bad "userPoolSub is null: the invocation was not attributed to anyone"
+      elif [ "$LOGGED_SUB" = "$TOKEN_SUB" ]; then
+        ok "logged userPoolSub is the id_token's own sub ($LOGGED_SUB)"
+      else
+        bad "logged userPoolSub '$LOGGED_SUB' is not the id_token's sub '$TOKEN_SUB'"
+      fi
+    fi
+  fi
+
+  # And the gate closes: same credentials, same valid signature, no id_token.
+  # Without this, a handler that ignored the header entirely would still pass
+  # every check above.
+  read -r NOTOKEN_STATUS _ <<<"$(signed_post "")"
+  if [ "$NOTOKEN_STATUS" = "401" ]; then
+    ok "signed call carrying no x-bench-id-token returns 401 (fail-closed)"
+  else
+    bad "signed call with no id_token returned $NOTOKEN_STATUS, expected 401"
+  fi
+fi
+
+step "7. users after this run"
 aws cognito-idp list-users --user-pool-id "$POOL_ID" --region "$REGION" \
   --query 'Users[].[Username,UserStatus,UserCreateDate]' --output text | sed 's/^/    /'
 

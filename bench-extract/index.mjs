@@ -14,15 +14,30 @@
 //
 // The Function URL is IAM-authenticated (AuthType: AWS_IAM, see
 // template.yaml): Lambda refuses an unsigned or unauthorized request with 403
-// before this handler runs, so there is no in-handler auth check and no
-// shared secret. The only principal granted lambda:InvokeFunctionUrl is the
-// bench-auth authenticated Identity Pool role, so every event arriving here
-// belongs to a signed-in Cognito user, recorded by readCallerIdentity below.
+// before this handler runs, so there is no in-handler *authorization* check
+// and no shared secret. The only principal granted lambda:InvokeFunctionUrl
+// is the bench-auth authenticated Identity Pool role, so every event arriving
+// here belongs to a signed-in Cognito user.
+//
+// WHICH signed-in user is a separate question, and IAM cannot answer it over
+// a Function URL. requestContext.authorizer.iam.cognitoIdentity is documented
+// as never populated there ("Function URLs don't use this parameter"), and
+// Cognito's enhanced flow gives every user of the role the same assumed-role
+// session name, so userArn and userId are identical across users too. The
+// caller therefore sends its Cognito id_token in the x-bench-id-token header
+// and verifyCallerToken below verifies it against the pool's JWKS.
+//
+// That is attribution, not a second authorization layer, and it is not the
+// x-bench-token shared secret coming back: this is a short-lived RS256 JWT
+// scoped to one user, signed by Cognito and verifiable here, and IAM still
+// gates the endpoint underneath it.
+//
 // Any URL the caller asks for must still pass assertAllowedUrl: a signed-in
 // user is authenticated, not trusted with an open fetch proxy. See
 // ../../SECURITY.md for why each guardrail exists and what it does not cover.
 
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
+import { CognitoJwtVerifier } from 'aws-jwt-verify'
 
 // An inference profile ID (`au.anthropic.…`), not a bare foundation-model ID.
 // Converse takes either in modelId; the profile keeps routing inside Australia
@@ -33,6 +48,18 @@ const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID
 // here any more: IAM auth on the Function URL replaced the shared secret. The
 // environment variable stays wired until Phase 4 so a rollback to the
 // pre-cutover template is a single deploy.
+
+// The Cognito pool an incoming id_token must come from. These arrive as plain
+// template parameters (template.yaml), deliberately not as a CloudFormation
+// ImportValue from the bench-auth stack: the two stacks are kept uncoupled,
+// and an Export would make bench-auth undeletable and its outputs unrenamable
+// from here. The cost is that these two values can drift if the pool is ever
+// recreated, in which case every call 401s at once; bench-auth/verify-e2e.sh
+// asserts they still match the live bench-auth stack outputs.
+const USER_POOL_ID = process.env.USER_POOL_ID
+const USER_POOL_CLIENT_ID = process.env.USER_POOL_CLIENT_ID
+const ID_TOKEN_HEADER = 'x-bench-id-token'
+
 const MAX_PAGE_TEXT_CHARS = 15000
 const MAX_PAGE_BYTES = 2 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 8000
@@ -157,20 +184,30 @@ Never invent a value that isn't stated or directly computable from a stated
 value. Missing information is null, not a guess.`
 
 export const handler = async (event) => {
-  // No auth check here. Under AuthType: AWS_IAM an unsigned or unauthorized
-  // request is refused by Lambda at 403 and never reaches this line, so a
-  // check would be a 401 for legitimate callers rather than a second layer.
-  // Logging who called is the point instead: per-user quotas are deferred, so
-  // this line is what answers "who" when the invocation alarm fires, and it
-  // is what makes quotas addable later without a second cutover.
-  const caller = readCallerIdentity(event)
-  console.log(
-    JSON.stringify({
-      msg: 'bench-extract invocation',
-      identityId: caller.identityId,
-      userPoolSub: caller.userPoolSub,
-    }),
-  )
+  // Authorization already happened: under AuthType: AWS_IAM an unsigned or
+  // unauthorized request is refused by Lambda at 403 and never reaches this
+  // line. What is left is attribution -- WHICH signed-in user this is -- and
+  // IAM cannot supply that over a Function URL (see the file header). So the
+  // caller's id_token is verified here, before anything is fetched or sent to
+  // Bedrock, and a request that cannot be attributed is refused rather than
+  // recorded as nobody.
+  let userPoolSub
+  try {
+    userPoolSub = await verifyCallerToken(event)
+  } catch (err) {
+    console.warn(
+      JSON.stringify({
+        msg: 'bench-extract identity rejected',
+        reason: err?.reason ?? 'unknown',
+      }),
+    )
+    return jsonResponse(401, { error: 'Missing or invalid identity token.' })
+  }
+
+  // Per-user quotas are deferred, so this line is what answers "who" when the
+  // invocation alarm fires, and it is what makes those quotas addable later
+  // without a second cutover.
+  console.log(JSON.stringify({ msg: 'bench-extract invocation', userPoolSub }))
 
   let body
   try {
@@ -237,28 +274,74 @@ function parseBody(event) {
   return parsed
 }
 
-// Who signed this request, for the log line in the handler.
-//
-// Returning nulls is not an error path and must not throw: the request is
-// already authorized by IAM before it gets here, so failing it in JavaScript
-// would be re-deciding something Lambda has decided. A null pair means the
-// shape was not what we expected, and the log line says so rather than the
-// invocation dying.
-//
-// identityId is the Identity Pool identity (ap-southeast-2:<uuid>), stable per
-// user. The User Pool sub has no field of its own: it arrives inside the amr
-// array as "<user-pool-id>:CognitoSignIn:<sub>", alongside entries like
-// "authenticated" and the bare pool ARN, so it is matched on that marker
-// rather than taken by index.
-export function readCallerIdentity(event) {
-  const identity = event?.requestContext?.authorizer?.iam?.cognitoIdentity
-  if (!identity) return { identityId: null, userPoolSub: null }
+// Thrown by verifyCallerToken. `reason` is a short machine-readable tag for
+// the log line and never carries any part of the token: an id_token is a
+// bearer credential and also holds the user's email address, so neither it nor
+// a verifier message that might quote its claims goes anywhere near the logs.
+class CallerTokenError extends Error {
+  constructor(reason) {
+    super(reason)
+    this.name = 'CallerTokenError'
+    this.reason = reason
+  }
+}
 
-  const amr = Array.isArray(identity.amr) ? identity.amr : []
-  const signIn = amr.find((e) => typeof e === 'string' && e.includes(':CognitoSignIn:'))
-  const userPoolSub = signIn ? signIn.slice(signIn.lastIndexOf(':') + 1) || null : null
+// Built on first use rather than at module load, so importing this file (the
+// unit tests do) needs no environment and makes no network call. The instance
+// is kept at module scope because aws-jwt-verify caches the pool's JWKS on it:
+// that is one JWKS fetch per cold start, not one per invocation.
+let cachedVerifier = null
+function defaultVerifier() {
+  if (!cachedVerifier) {
+    cachedVerifier = CognitoJwtVerifier.create({
+      userPoolId: USER_POOL_ID,
+      clientId: USER_POOL_CLIENT_ID,
+      // Checked, not assumed, so a Cognito access token for the same user
+      // cannot be passed off as an id_token. `aud` is checked against
+      // clientId by the same call.
+      tokenUse: 'id',
+    })
+  }
+  return cachedVerifier
+}
 
-  return { identityId: identity.identityId ?? null, userPoolSub }
+// Who is calling, from the id_token in x-bench-id-token.
+//
+// This throws where the readCallerIdentity it replaces returned nulls, and the
+// change is the point rather than a side effect. A null sub is
+// indistinguishable from a caller who simply left the header off, so a log
+// line that tolerates one cannot be trusted and a quota built on it could be
+// opted out of by anyone already holding the role. IAM has decided the call is
+// allowed; this decides whose budget it lands on, and an unattributable call
+// is refused rather than recorded as nobody.
+//
+// The verifier is a parameter so tests can supply one primed with a local
+// JWKS. Production passes nothing and gets the module-scope instance, which is
+// resolved only after the header check below: a call with no token is refused
+// without ever needing pool configuration or a JWKS.
+export async function verifyCallerToken(event, verifier = null) {
+  const headers = event?.headers ?? {}
+  // Function URLs lowercase incoming header names, but a client signing by
+  // hand can send any case and that should not become a 401 nobody can
+  // explain.
+  const key = Object.keys(headers).find((h) => h.toLowerCase() === ID_TOKEN_HEADER)
+  const token = key ? headers[key] : null
+  if (!token) throw new CallerTokenError('missing-header')
+
+  let payload
+  try {
+    payload = await (verifier ?? defaultVerifier()).verify(token)
+  } catch (err) {
+    // constructor.name, not err.name: aws-jwt-verify subclasses Error without
+    // setting the name property, so err.name reads "Error" for every failure
+    // and tells you nothing. The constructor is the specific one
+    // (JwtExpiredError, CognitoJwtInvalidClientIdError, ...). The message is
+    // deliberately not carried: it quotes claim values back at you.
+    throw new CallerTokenError(err?.constructor?.name ?? 'verify-failed')
+  }
+
+  if (typeof payload?.sub !== 'string' || !payload.sub) throw new CallerTokenError('no-sub')
+  return payload.sub
 }
 
 // Throws a 400-flagged error (rather than the 502 an upstream failure gets)
