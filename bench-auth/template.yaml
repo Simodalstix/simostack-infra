@@ -109,13 +109,15 @@ Resources:
           RequireNumbers: true
           RequireSymbols: true
       MfaConfiguration: 'OFF'
-      # INACTIVE deliberately, and correct for Phases 1 and 2: this stack may
-      # still need tearing down and redeploying, and the only accounts in the
-      # pool are test ones. Flipping it to ACTIVE is an entry gate on Phase 3 --
-      # it must be deployed before the login UI ships in vue-simostack, because
-      # that is the moment the pool starts holding real users, and deleting a
-      # user pool deletes its users unrecoverably. See README, "Phases".
-      DeletionProtection: INACTIVE
+      # ACTIVE as of 2026-08-30. This was the Phase 3 entry gate: INACTIVE was
+      # correct through Phases 1 and 2, while the stack might still need tearing
+      # down and the only accounts in the pool were test ones. It was flipped
+      # and deployed before the login UI ships in vue-simostack, because that is
+      # the moment the pool starts holding real users, and deleting a user pool
+      # deletes its users unrecoverably. The deploy was an in-place update, no
+      # replacement. Consequence: tearing this stack down now takes flipping
+      # this back to INACTIVE and deploying that first. See README, "Phases".
+      DeletionProtection: ACTIVE
 
   # Hosted-UI domain. The redirect URI registered in Google Cloud Console is
   # derived from this prefix and must be registered BEFORE this stack is first

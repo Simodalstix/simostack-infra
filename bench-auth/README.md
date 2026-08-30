@@ -8,9 +8,10 @@ bench-extract Function URL.
 2026-08-25 and verified 2026-08-27, as the stack `bench-auth` in
 `ap-southeast-2`; Phase 2 -- the bench-extract cutover to `AuthType: AWS_IAM`
 with id_token attribution -- deployed and verified 2026-08-29, `verify-e2e.sh`
-12/12. Phases 3 and 4 have not started, so the deployed frontend is still
-broken by design. See "Verifying" below for what the verification does and does
-not cover.
+12/12. Phases 3 and 4 have not started -- only Phase 3's entry gate, the User
+Pool's `DeletionProtection: ACTIVE`, is deployed (2026-08-30) -- so the
+deployed frontend is still broken by design. See "Verifying" below for what the
+verification does and does not cover.
 
 ## What this replaces
 
@@ -104,12 +105,12 @@ boundary rather than a placeholder.
    signing code -- the id_token header has an ordering requirement relative to
    the signer that is easy to get wrong and impossible to see from the
    response.
-   - [ ] **Entry gate:** flip `DeletionProtection` on the User Pool from
-     `INACTIVE` to `ACTIVE` and deploy that change *before* the login UI ships.
-     `INACTIVE` is the right setting through Phases 1 and 2, while the pool
-     holds only test accounts and may need tearing down; shipping the login UI
-     is the moment it starts holding real users, and deleting a user pool
-     deletes its users unrecoverably.
+   - [x] **Entry gate, cleared 2026-08-30:** `DeletionProtection` on the User
+     Pool went `INACTIVE` → `ACTIVE` and was deployed as an in-place update,
+     no replacement. `INACTIVE` was the right setting through Phases 1 and 2,
+     while the pool held only test accounts and might need tearing down;
+     shipping the login UI is the moment it starts holding real users, and
+     deleting a user pool deletes its users unrecoverably.
 4. **Recalibrate and update `SECURITY.md`**: "the shared token is not
    authentication" closes as a gap; "open sign-up means anyone can spend the
    budget" opens in its place.
@@ -258,13 +259,14 @@ Phase 3 is work in `vue-simostack`, not here, but the constraints it has to
 meet are properties of what this repo deployed, so they are written down here
 rather than rediscovered there.
 
-### Entry gate, before any login UI ships
+### Entry gate, before any login UI ships -- cleared 2026-08-30
 
-- [ ] Flip `DeletionProtection` on the User Pool from `INACTIVE` to `ACTIVE`
-      and deploy that change. `INACTIVE` is right through Phases 1 and 2, while
-      the pool holds only test accounts; shipping login is the moment it starts
+- [x] `DeletionProtection` on the User Pool is `ACTIVE`, deployed in place with
+      no replacement. `INACTIVE` was right through Phases 1 and 2, while the
+      pool held only test accounts; shipping login is the moment it starts
       holding real users, and deleting a user pool deletes its users
-      unrecoverably.
+      unrecoverably. Nothing else in Phase 3 was blocked on this, so the rest of
+      this checklist is still open work in `vue-simostack`.
 
 ### Signing the call
 
@@ -416,10 +418,12 @@ before this goes to production.
 - The `UserPoolClientId`, `IdentityPoolId` and `HostedUiDomain` outputs are what
   Phase 3 needs in `vue-simostack`. Nothing carries them across automatically,
   the same as the Function URL handoff.
-- Leave `DeletionProtection` on the User Pool at `INACTIVE`. That is correct for
-  Phases 1 and 2, when the pool holds only test accounts; flipping it to
-  `ACTIVE` is an entry gate on Phase 3 (see "Phases" above), not a step to do
-  here.
+- `DeletionProtection` on the User Pool is `ACTIVE` as of 2026-08-30, the
+  Phase 3 entry gate (see "Phases" above). It was `INACTIVE` through Phases 1
+  and 2, when the pool held only test accounts. A first deploy into a fresh
+  account can start at `INACTIVE`, but note that with `ACTIVE` in the template
+  as it now stands, tearing the stack down takes flipping it back and deploying
+  that change first.
 
 ## Verifying
 
@@ -467,7 +471,9 @@ costs a real Bedrock call.
 
 - Phases 1 and 2 are deployed and verified end-to-end (2026-08-25/27 and
   2026-08-29). Phases 3 and 4 have not started, so the deployed frontend stays
-  broken by design until the login UI ships.
+  broken by design until the login UI ships. The one piece of Phase 3 that is
+  done is its entry gate: `DeletionProtection` on the User Pool is `ACTIVE` as
+  of 2026-08-30.
 - `bedrock:InvokeModel` is now proven denied by an observed live refusal, not
   only by `simulate-principal-policy`: the 2026-08-29 run passed step 4 with
   `--cli-binary-format raw-in-base64-out` in place, so the call reached Bedrock

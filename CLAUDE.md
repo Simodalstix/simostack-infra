@@ -10,7 +10,8 @@ design.
 - `bench-auth/`: Cognito auth for Bench. **Phases 1-2 are deployed and
   verified** -- the stack `bench-auth` in `ap-southeast-2`, plus the
   bench-extract cutover to `AuthType: AWS_IAM` (see below). Phases 3-4 are not
-  started, so the deployed frontend is still broken by design.
+  started -- only Phase 3's entry gate, `DeletionProtection: ACTIVE`, is
+  deployed (2026-08-30) -- so the deployed frontend is still broken by design.
 - `SECURITY.md`: repo-wide threat model and guardrail rationale.
 - `README.md`: repo overview, deploy model, cross-repo handoff.
 - `.github/workflows/`: one test workflow per service.
@@ -148,8 +149,10 @@ proving nothing" class that actually bit during Phase 1 verification.
   `ALLOW_REFRESH_TOKEN_AUTH` alone. There is no password auth flow, so a
   federated user's credentials **cannot** be re-obtained headlessly: every
   verification run needs a real browser sign-in.
-- `DeletionProtection` is `INACTIVE`, correct for Phases 1-2. It is the Phase 3
-  entry gate.
+- `DeletionProtection` is **`ACTIVE`** as of 2026-08-30, when the Phase 3 entry
+  gate was cleared (in-place update, no replacement). It was `INACTIVE` through
+  Phases 1-2. Tearing this stack down now means flipping it back to `INACTIVE`
+  and deploying that change first.
 - The authenticated role carries exactly two inline policies and no attached
   ones: `invoke-bench-extract-function-url` (`lambda:InvokeFunctionUrl` on the
   single bench-extract ARN, conditioned on `lambda:FunctionUrlAuthType` being
@@ -270,7 +273,7 @@ set as GitHub Actions secrets on `vue-simostack` and in its local `.env`
 error: the site calls the old one and every extraction fails as a network error
 that reads like a Lambda fault.
 
-## bench-auth (Phases 1-2 deployed and verified; Phases 3-4 not started)
+## bench-auth (Phases 1-2 verified; 3-4 not started, Phase 3 gate cleared)
 
 Replaced the shared `x-bench-token` header with Cognito. That token shipped in
 the public JS bundle and was never a secret. **The header check is gone from
@@ -375,10 +378,10 @@ sign up and spend the Bedrock budget. That is accepted, but it makes
    id_token is the same one already exchanged for the SigV4 credentials, so
    take both from a single refresh rather than caching them separately --
    pairing fresh credentials with a stale token is the failure mode.
-   **Entry gate:** the User Pool's
-   `DeletionProtection` goes `INACTIVE` → `ACTIVE`, deployed, before the login
-   UI ships. `INACTIVE` is correct through Phases 1-2; shipping login is when
-   the pool starts holding real users.
+   **Entry gate cleared 2026-08-30:** the User Pool's `DeletionProtection` is
+   `ACTIVE`, deployed as an in-place update with no replacement. `INACTIVE` was
+   correct through Phases 1-2; shipping login is when the pool starts holding
+   real users. The rest of Phase 3 is untouched work in `vue-simostack`.
 4. **Recalibrate and update `SECURITY.md`**: "the shared token is not
    authentication" closes; "open sign-up means anyone can spend the budget"
    opens in its place.
