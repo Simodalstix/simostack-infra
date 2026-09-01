@@ -15,15 +15,24 @@ verification does and does not cover.
 
 ## What this replaces
 
-Bench currently authenticates with a single shared access token
-(`VITE_BENCH_ACCESS_TOKEN`), which is inlined into the public JS bundle and is
-therefore readable by anyone who loads the site. It is not a secret and was
-never treated as one. See the "Access token" section of
-[`../bench-extract/README.md`](../bench-extract/README.md): what actually
-bounds abuse today is the Bedrock quota, reserved concurrency, the kill switch
-and the budget action, not the token. Those guardrails and the threat model
-behind them are in [`../SECURITY.md`](../SECURITY.md), which this service is
-expected to satisfy rather than replace.
+Bench used to authenticate with a single shared access token
+(`VITE_BENCH_ACCESS_TOKEN`), inlined into the public JS bundle and therefore
+readable by anyone who loaded the site. It was not a secret and was never
+treated as one. **That is done: the handler stopped reading it at the Phase 2
+cutover on 2026-08-29, and Phase 4 retired the parameter and the environment
+variable on 2026-09-01** -- see "Access token (retired in Phase 4)" in
+[`../bench-extract/README.md`](../bench-extract/README.md), kept there for why
+it has no rotation successor.
+
+Replacing it does not change what bounds abuse, and that is the point worth
+holding onto: spend is bounded by the Bedrock quota, reserved concurrency, the
+kill switch and the budget action, and it was bounded by exactly those before
+this service existed. Authentication was never one of the layers. With open
+sign-up it still isn't -- anyone with a Google account can now obtain a valid
+identity, so the budget cap is doing the work the token never did. Those
+guardrails and the threat model behind them are in
+[`../SECURITY.md`](../SECURITY.md), which this service is expected to satisfy
+rather than replace.
 
 ## The constraint this service exists to hold
 
@@ -248,10 +257,15 @@ breakage window, not a regression.
       parameter costs nothing to hold.
 - [ ] Leave `VITE_BENCH_ACCESS_TOKEN` in `vue-simostack` alone. Phase 3 retires
       it there, when the login UI replaces it.
-- [ ] **Retire in Phase 4**, not before: delete the template parameter, the
-      environment variable and the SSM parameter itself, and cut the access
-      token and rotation sections from `../bench-extract/README.md`, in the same
-      change that recalibrates `SECURITY.md`.
+- [x] **Retired in Phase 4 on 2026-09-01**: the `BenchAccessTokenParameterName`
+      template parameter and the `BENCH_ACCESS_TOKEN` environment variable are
+      out of `../bench-extract/template.yaml`, the access token and rotation
+      sections are cut from `../bench-extract/README.md`, and `../SECURITY.md`
+      is recalibrated. **The `/bench/access-token` SSM parameter is deleted
+      separately from that deploy**, because an
+      `AWS::SSM::Parameter::Value<String>` is a deploy-time lookup rather than a
+      stack resource: the template change does not touch it, and rollback stays
+      a single deploy for as long as it is left in place.
 
 ## Phase 3 checklist
 
@@ -300,8 +314,10 @@ same as the Function URL handoff.
 - [ ] `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `HostedUiDomain`.
 - [ ] The bench-extract Function URL, unchanged by the cutover.
 - [ ] Retire `VITE_BENCH_ACCESS_TOKEN` from the local `.env` and the GitHub
-      Actions secrets once the login flow replaces it. The SSM parameter and
-      the `BENCH_ACCESS_TOKEN` environment variable stay until Phase 4.
+      Actions secrets once the login flow replaces it. In flight as of
+      2026-09-01. Nothing is blocked on it in either direction: the handler has
+      not read the header since 2026-08-29, and the infra side of the retirement
+      (Phase 4) is done regardless of when this lands.
 
 ### CORS
 
@@ -374,7 +390,10 @@ deploying.
 
 ## Deploying
 
-Not yet done. When it is:
+Done: deployed 2026-08-25 as stack `bench-auth` in `ap-southeast-2`. Kept as
+the record of how, and as the procedure for a rebuild. **Note
+`DeletionProtection` is now `ACTIVE`** (since 2026-08-30), so tearing this pool
+down means deploying it back to `INACTIVE` first.
 
 ```bash
 cd bench-auth

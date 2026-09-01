@@ -44,10 +44,16 @@ import { CognitoJwtVerifier } from 'aws-jwt-verify'
 // and is what the execution role is scoped to. Don't strip the `au.` prefix
 // here without widening the IAM policy in template.yaml to match.
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID
-// BENCH_ACCESS_TOKEN is still set by template.yaml but deliberately not read
-// here any more: IAM auth on the Function URL replaced the shared secret. The
-// environment variable stays wired until Phase 4 so a rollback to the
-// pre-cutover template is a single deploy.
+// There is deliberately no shared-secret env var here. IAM auth on the
+// Function URL replaced the x-bench-token header at the Phase 2 cutover, and
+// Phase 4 removes what was left wired for rollback: BENCH_ACCESS_TOKEN and the
+// BenchAccessTokenParameterName template parameter are gone from
+// template.yaml. That template change does NOT delete the /bench/access-token
+// SSM parameter -- AWS::SSM::Parameter::Value<String> is a deploy-time lookup,
+// not a stack resource -- so deleting it is a separate, deliberate step, and
+// until it is taken a rollback to the pre-Phase-4 template is still one
+// deploy. Reinstating a shared secret here would be a regression, not a
+// fallback.
 
 // The Cognito pool an incoming id_token must come from. These arrive as plain
 // template parameters (template.yaml), deliberately not as a CloudFormation

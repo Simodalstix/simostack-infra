@@ -7,11 +7,12 @@ design.
 ## Structure
 - `bench-extract/`: Bedrock-backed Lambda (listing extraction), SAM app. Built
   and deployed.
-- `bench-auth/`: Cognito auth for Bench. **Phases 1-2 are deployed and
-  verified** -- the stack `bench-auth` in `ap-southeast-2`, plus the
-  bench-extract cutover to `AuthType: AWS_IAM` (see below). Phases 3-4 are not
-  started -- only Phase 3's entry gate, `DeletionProtection: ACTIVE`, is
-  deployed (2026-08-30) -- so the deployed frontend is still broken by design.
+- `bench-auth/`: Cognito auth for Bench. **Phases 1-3 are deployed and
+  verified** -- the stack `bench-auth` in `ap-southeast-2`, the bench-extract
+  cutover to `AuthType: AWS_IAM`, and the vue-simostack login/SigV4 work (see
+  below). The breakage window that ran from the Phase 2 cutover is closed; the
+  deployed frontend works. **Phase 4 is authored here but NOT deployed** as of
+  2026-09-01.
 - `SECURITY.md`: repo-wide threat model and guardrail rationale.
 - `README.md`: repo overview, deploy model, cross-repo handoff.
 - `.github/workflows/`: one test workflow per service.
@@ -25,7 +26,8 @@ The READMEs are the source of truth and are detailed. Read rather than infer:
   included, not just bench-extract. Read before writing a public endpoint or
   loosening a guardrail.
 - `bench-extract/README.md` is the procedure: account prerequisites, first
-  deploy, token rotation, incident recovery.
+  deploy, incident recovery. There is no token rotation section any more; Phase
+  4 cut it, and the reason it has no successor is written down in its place.
 - `bench-auth/README.md`: what the service is meant to replace.
 
 ## Conventions
@@ -98,7 +100,12 @@ proving nothing" class that actually bit during Phase 1 verification.
   `sam-app`**, the `--guided` default, never changed. There is no stack named
   `bench-extract`; looking for one and concluding nothing is deployed is the
   easy mistake. The Lambda itself is `bench-extract`.
-- Reserved concurrency is 1, matching the template. `bench-extract-high-invocations`
+- Reserved concurrency is **2**, matching the template; it went 1 -> 2 at the
+  Phase 2 cutover, not in Phase 4 as the phase list once implied. Read it with
+  `aws lambda get-function-concurrency` -- `get-function-configuration` does
+  **not** return the field, and its absence there is indistinguishable from no
+  reserved concurrency at all, i.e. from the kill switch's layer being gone.
+  `bench-extract-high-invocations`
   (logical ID `BenchHighInvocationAlarm`) is in `OK`.
 - Budget parameters are deliberate values, not placeholders:
   `BudgetMonthlyLimitUsd=10` and `EarlyWarningBudgetUsd=1`, justified in
@@ -267,19 +274,27 @@ pre-split commits are the originals and their messages describe paths under
 they agree across the repo boundary, so a contract change here is half a change
 until that file is updated.
 
-Also carried by hand across that boundary: the Function URL and access token,
-set as GitHub Actions secrets on `vue-simostack` and in its local `.env`
-(`VITE_BENCH_EXTRACT_URL`, `VITE_BENCH_ACCESS_TOKEN`). A stale URL doesn't
-error: the site calls the old one and every extraction fails as a network error
-that reads like a Lambda fault.
+Also carried by hand across that boundary: the Function URL, set as a GitHub
+Actions secret on `vue-simostack` and in its local `.env`
+(`VITE_BENCH_EXTRACT_URL`). A stale URL doesn't error: the site calls the old
+one and every extraction fails as a network error that reads like a Lambda
+fault. `VITE_BENCH_ACCESS_TOKEN` used to be carried the same way and is retired;
+what crosses now instead are the bench-auth stack outputs the frontend signs
+with (`UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `HostedUiDomain`).
 
-## bench-auth (Phases 1-2 verified; 3-4 not started, Phase 3 gate cleared)
+## bench-auth (Phases 1-3 verified; Phase 4 authored, not deployed)
 
 Replaced the shared `x-bench-token` header with Cognito. That token shipped in
 the public JS bundle and was never a secret. **The header check is gone from
-`bench-extract/index.mjs` as of the Phase 2 cutover on 2026-08-29**; the
-`BENCH_ACCESS_TOKEN` environment variable and its SSM parameter are still wired
-but unread, and Phase 4 retires them.
+`bench-extract/index.mjs` as of the Phase 2 cutover on 2026-08-29.** Phase 4
+then removed the `BENCH_ACCESS_TOKEN` environment variable and the
+`BenchAccessTokenParameterName` template parameter, and recalibrated
+`SECURITY.md`. **That change is committed but not deployed**, so the live Lambda
+still carries the (unread) environment variable, and `/bench/access-token` is
+still in SSM: the template change does not delete it, since
+`AWS::SSM::Parameter::Value<String>` is a deploy-time lookup rather than a stack
+resource. Deleting the parameter is a separate step and is what finally closes
+rollback.
 
 Work through the design checklist in `SECURITY.md` before extending any of this.
 
@@ -381,10 +396,24 @@ sign up and spend the Bedrock budget. That is accepted, but it makes
    **Entry gate cleared 2026-08-30:** the User Pool's `DeletionProtection` is
    `ACTIVE`, deployed as an in-place update with no replacement. `INACTIVE` was
    correct through Phases 1-2; shipping login is when the pool starts holding
-   real users. The rest of Phase 3 is untouched work in `vue-simostack`.
-4. **Recalibrate and update `SECURITY.md`**: "the shared token is not
-   authentication" closes; "open sign-up means anyone can spend the budget"
-   opens in its place.
+   real users.
+
+   **Shipped and verified live.** The frontend signs with `aws4fetch` and a
+   hand-rolled PKCE flow, no AWS SDK. Confirmed from this side rather than
+   taken on report: `/aws/lambda/bench-extract` carries invocations on
+   2026-08-30 logging a real non-null `userPoolSub`, where the same log line on
+   2026-08-29 read `null`. Retiring `VITE_BENCH_ACCESS_TOKEN` from the frontend
+   `.env` and the GitHub Actions secrets is the tail of this phase and was in
+   flight on 2026-09-01.
+4. **Retire the shared token outright and recalibrate `SECURITY.md`**: drop the
+   `BenchAccessTokenParameterName` parameter and the `BENCH_ACCESS_TOKEN`
+   environment variable, cut the access-token and rotation sections from
+   `bench-extract/README.md`, delete the `/bench/access-token` SSM parameter,
+   and rewrite the `SECURITY.md` entry -- "the shared token is not
+   authentication" closes, "open sign-up means anyone with a Google account can
+   spend the budget" opens in its place. **Authored 2026-09-01, not yet
+   deployed.** Note that the concurrency 1 -> 2 recalibration once listed here
+   already landed with Phase 2.
 
 ### Kill-switch drill (last passed 2026-08-22)
 

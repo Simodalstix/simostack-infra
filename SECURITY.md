@@ -23,8 +23,12 @@ realistic failure modes, in order of likelihood:
    left running. By far the most likely way to spend real money.
 2. **Opportunistic bots.** Public Lambda Function URLs get scanned within hours
    of existing. They are not after data; they hammer anything that responds.
-3. **Someone finding the shared token** in the JS bundle, where it is plainly
-   visible, and using the endpoint as free infrastructure.
+3. **Someone signing up and using the endpoint as free infrastructure.**
+   Sign-up is open self-service Google federation with no approval gate, so any
+   Google account can reach the extraction path. This is the recalibrated
+   version of an older, worse entry: a shared token that shipped in the JS
+   bundle, plainly visible to anyone who looked. Authentication got real; the
+   population that can obtain it is still everybody.
 
 The blast radius of all three is **a bill, not a breach**: no customer data
 behind the endpoint, no database, no VPC. So the guardrails optimise for
@@ -194,12 +198,19 @@ deploy-time and account-level steps are in the Lambda README.
 
 Stated plainly so it is not mistaken for done:
 
-- **The shared token is not authentication.** It ships in the public JS bundle.
-  It filters bots; it does not stop a person who reads the bundle. *Closing:
-  bench-extract's Function URL moved to `AuthType: AWS_IAM` on 2026-08-29 and
-  the handler no longer reads `x-bench-token`. Phase 4 of bench-auth rewrites
-  this entry; what replaces it is "open sign-up means anyone with a Google
-  account can spend the budget".*
+- **Open sign-up means anyone with a Google account can spend the budget.**
+  Authentication is genuine now: the Function URL is `AuthType: AWS_IAM`, every
+  request is SigV4-signed by the bench-auth authenticated role, and the handler
+  fails closed at 401 without a verifiable id_token. None of that is a spend
+  boundary, because sign-up is self-service Google federation with no approval
+  gate and no pre-sign-up allowlist, and the caps are global with no per-user
+  quota. `BudgetMonthlyLimitUsd` is therefore the actual boundary rather than a
+  placeholder, and the kill switch is the only fast brake. Accepted
+  deliberately at an expected scale under 5 users; 10 is the revisit point.
+  *This entry replaced "the shared token is not authentication" at the Phase 4
+  recalibration on 2026-09-01. The token was retired outright, not
+  supplemented: the handler stopped reading it on 2026-08-29 and the template
+  parameter, the environment variable and the SSM parameter followed.*
 - **`x-bench-id-token` is not the shared token returning.** The handler does
   verify a token again, so the resemblance is worth addressing directly: that
   header carries a short-lived RS256 id_token minted by Cognito for one user
@@ -228,10 +239,13 @@ Stated plainly so it is not mistaken for done:
   action still reads the parameter store through the changeset API, and an IAM
   policy that only restricts `ssm:GetParameter` is not a boundary. This is a
   property of the mechanism, not of any one parameter: it applies to every
-  SSM-sourced parameter this stack ever takes, and it outlives
-  `BenchAccessToken`, which bench-auth's Phase 2 cutover stopped reading and
-  Phase 4 retires outright. Today the exposure is nil, since that token ships
-  in the public bundle anyway, and CI holds no AWS credentials and makes no
-  CloudFormation calls. Treat it as a constraint on who
+  SSM-sourced parameter this stack ever takes, and it outlived
+  `BenchAccessToken`, the only parameter that ever exercised it: Phase 2 stopped
+  the handler reading it, and Phase 4 removed it from the template on
+  2026-09-01. **The stack now takes no SSM-sourced parameter at all, so today's
+  exposure is nil** -- but that is a fact about the current template, not a
+  property of it, and the next `AWS::SSM::Parameter::Value<String>` added here
+  reopens it silently and with no warning at deploy time. CI holds no AWS
+  credentials and makes no CloudFormation calls. Treat it as a constraint on who
   gets `DescribeChangeSet`, and on pasting raw changeset output anywhere, rather
   than as a reason to avoid SSM.

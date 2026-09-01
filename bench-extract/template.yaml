@@ -35,35 +35,6 @@ Description: >
   Reasoning and the deploy-time checklist live in the repo's SECURITY.md.
 
 Parameters:
-  # The SSM parameter NAME, not the token itself. CloudFormation resolves the
-  # name to its value at deploy time, so the token never has to be typed at a
-  # --guided prompt or saved into samconfig.toml, and rotating it is one
-  # put-parameter plus a redeploy. The parameter must already exist in the
-  # deploy region or the stack fails at validation with "does not exist".
-  #
-  # Plain String, deliberately not SecureString. Two reasons. The technical
-  # one: AWS::SSM::Parameter::Value<String> does not support SecureString, and
-  # {{resolve:ssm-secure}} is only allowed in an allowlist of resource
-  # properties that does not include Lambda environment variables, so a
-  # SecureString could not reach BENCH_ACCESS_TOKEN through this template at
-  # all. The honest one: this value is inlined into the public JS bundle as
-  # VITE_BENCH_ACCESS_TOKEN and is readable by anyone who loads the site, so
-  # encrypting it at rest with KMS would protect a value that is already
-  # published. Store it in SSM for the rotation workflow, not for secrecy.
-  BenchAccessTokenParameterName:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /bench/access-token
-    Description: >
-      Name of the SSM parameter that held the shared secret the frontend sent
-      as the x-bench-token header (VITE_BENCH_ACCESS_TOKEN). VESTIGIAL SINCE
-      THE PHASE 2 CUTOVER: the handler no longer reads BENCH_ACCESS_TOKEN, and
-      IAM auth on the Function URL replaced it. Left wired on purpose, so a
-      rollback to the pre-cutover template is one deploy rather than a re-seed
-      of the SSM parameter, and it costs nothing to hold. Retire it in Phase 4
-      together with the environment variable and the parameter itself. Seed it
-      with e.g.
-      `aws ssm put-parameter --name /bench/access-token --type String
-      --value "$(openssl rand -hex 24)" --region ap-southeast-2`.
   BedrockModelId:
     Type: String
     Default: au.anthropic.claude-haiku-4-5-20251001-v1:0
@@ -191,9 +162,6 @@ Resources:
       ReservedConcurrentExecutions: 2
       Environment:
         Variables:
-          # Resolves to the parameter's VALUE, not its name: that is what the
-          # AWS::SSM::Parameter::Value<String> type does to a !Ref.
-          BENCH_ACCESS_TOKEN: !Ref BenchAccessTokenParameterName
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           BEDROCK_REGION: !Ref BedrockRegion
           USER_POOL_ID: !Ref UserPoolId

@@ -153,14 +153,6 @@ review. Do them first, per account and per region.
 - **Lower the Bedrock on-demand rate quota** to roughly 1-2x realistic personal
   usage. Do this early, not during an incident: the Service Quotas console form
   is built for _increases_, and a decrease generally needs a support case.
-- **Seed the access token in SSM Parameter Store**, in the deploy region. The
-  template takes the parameter NAME and resolves it to the value at deploy
-  time, so the stack fails at validation if this does not exist yet:
-
-  ```bash
-  aws ssm put-parameter --name /bench/access-token --type String \
-    --value "$(openssl rand -hex 24)" --region ap-southeast-2
-  ```
 
 ### Deploy
 
@@ -170,9 +162,9 @@ sam build
 sam deploy --guided
 ```
 
-Guided mode prompts for `BenchAccessTokenParameterName`, `BedrockModelId`,
-`BedrockFoundationModelId`, `BedrockRegion`, `BudgetMonthlyLimitUsd`,
-`EarlyWarningBudgetUsd`, `AlertEmail`, `UserPoolId` and `UserPoolClientId`. The
+Guided mode prompts for `BedrockModelId`, `BedrockFoundationModelId`,
+`BedrockRegion`, `BudgetMonthlyLimitUsd`, `EarlyWarningBudgetUsd`, `AlertEmail`,
+`UserPoolId` and `UserPoolClientId`. The
 two model parameters are the same string with and without the `au.` prefix: the
 profile the request names, and the underlying model IAM has to authorize it
 against. Change one, change both.
@@ -194,11 +186,6 @@ is in the template comment above the parameters. **Adding them to an existing
 deployment means hand-editing `parameter_overrides` in `samconfig.toml`, not
 re-running `--guided`**, which would overwrite every other real value with a
 default.
-
-`BenchAccessTokenParameterName` defaults to `/bench/access-token` and is the
-SSM parameter's **name**, not the token. Accept the default and CloudFormation
-fetches the value itself, so the token is never typed at a prompt and never
-lands in `samconfig.toml`.
 
 Two prompts are worth knowing about in advance:
 
@@ -232,18 +219,20 @@ The deploy ends in this repo but the result is consumed in another one. There
 is no pipeline across that boundary: the Function URL is carried over by hand,
 and nothing will tell you if you skip it.
 
-- `sam deploy` prints `BenchExtractFunctionUrl`. That value, plus the access
-  token, has to be set by hand in the frontend repo (`vue-simostack`) in two
-  places, because the site reads them at build time as
-  `VITE_BENCH_EXTRACT_URL` and `VITE_BENCH_ACCESS_TOKEN`:
-  1. As GitHub Actions repo secrets on `vue-simostack`, which is what the
+- `sam deploy` prints `BenchExtractFunctionUrl`. That value has to be set by
+  hand in the frontend repo (`vue-simostack`), because the site reads it at
+  build time as `VITE_BENCH_EXTRACT_URL`, in two places:
+  1. As a GitHub Actions repo secret on `vue-simostack`, which is what the
      deployed site is built with.
   2. In a local `.env` there (`cp .env.example .env` at that repo's root),
      which is what `npm run dev` reads. Its `.gitignore` covers `.env` and
      `.env.*`, so the filled-in copy stays local.
 
-  Leaving both unset is also fine: the add-listing flow falls back to stand-in
-  data and spends nothing.
+  It is the only value this stack hands over now. `VITE_BENCH_ACCESS_TOKEN` is
+  retired: the caller authenticates with SigV4 credentials from the bench-auth
+  Identity Pool instead, and the values it needs for that (`UserPoolId`,
+  `UserPoolClientId`, `IdentityPoolId`, `HostedUiDomain`) come from the
+  `bench-auth` stack's outputs, not from here.
 - Then run `scripts/post-deploy.sh` from the root of `vue-simostack` (the
   script lives there, not here, because the check it performs is a comparison
   against that repo's `.env`). It prints the Function URL from the stack and
@@ -337,39 +326,34 @@ and nothing will tell you if you skip it.
 - Confirm `Cors.AllowOrigins` in `template.yaml` matches the real deployed
   domains (currently `simostack.com` / `www.simostack.com`).
 
-## Access token
+## Access token (retired in Phase 4, 2026-09-01)
 
-`BenchAccessToken` lives in SSM Parameter Store (`/bench/access-token`,
-ap-southeast-2), not in `samconfig.toml` and not at a `--guided` prompt.
-`template.yaml` takes the parameter name and CloudFormation resolves it to the
-value at deploy time.
+There is no longer one, and nothing here rotates. `BenchAccessToken` was a
+shared string in SSM (`/bench/access-token`) that the frontend sent as
+`x-bench-token`. It was inlined into the public JS bundle as
+`VITE_BENCH_ACCESS_TOKEN`, so it was readable by anyone who loaded the site: it
+filtered bots and did nothing else. The handler stopped reading it at the Phase
+2 cutover on 2026-08-29, when the Function URL moved to `AuthType: AWS_IAM`,
+and Phase 4 removed the `BenchAccessTokenParameterName` template parameter and
+the `BENCH_ACCESS_TOKEN` environment variable.
 
-It is a plain `String`, not a `SecureString`, for two reasons. The technical
-one: `AWS::SSM::Parameter::Value<String>` does not accept a SecureString, and
-`{{resolve:ssm-secure}}` is restricted to an allowlist of resource properties
-that excludes Lambda environment variables, so a SecureString cannot reach
-`BENCH_ACCESS_TOKEN` through this template at all. The honest one: this value
-is inlined into the public JS bundle as `VITE_BENCH_ACCESS_TOKEN` and is
-readable by anyone who loads the site, so encrypting it at rest would be
-protecting something already published. SSM is here for the rotation
-workflow, not for secrecy. What actually bounds abuse is the Bedrock quota,
-`ReservedConcurrentExecutions`, the kill switch and the budget action.
+What replaced it is not another header to rotate. Callers are SigV4-signed with
+short-lived credentials from the bench-auth Identity Pool, and identify
+themselves with a short-lived Cognito id_token in `x-bench-id-token` that the
+handler verifies against the pool's JWKS. Both expire in about an hour and both
+are minted per user by Cognito, so there is no long-lived value in this repo to
+store, publish or roll. See [`../bench-auth/README.md`](../bench-auth/README.md).
 
-**Rotating it:**
+**Deleting the SSM parameter is a separate step from the deploy, on purpose.**
+`AWS::SSM::Parameter::Value<String>` is a deploy-time lookup, not a stack
+resource, so dropping it from `template.yaml` leaves `/bench/access-token`
+sitting in Parameter Store untouched. While it sits there, a rollback to the
+pre-Phase-4 template is a single deploy. Delete it only once you are confident
+you will not roll back:
 
-1. ```bash
-   aws ssm put-parameter --name /bench/access-token --type String \
-     --value "$(openssl rand -hex 24)" --overwrite --region ap-southeast-2
-   ```
-2. Update `VITE_BENCH_ACCESS_TOKEN` in the local `.env` in `vue-simostack`.
-3. Update the `VITE_BENCH_ACCESS_TOKEN` GitHub Actions secret on
-   `vue-simostack`.
-4. `sam build && sam deploy`, no prompts expected.
-
-Order matters on the way out. The Lambda starts rejecting the old token the
-moment step 4 lands, so the deployed site keeps sending the old one until the
-next build ships step 3. Either accept a window of failed extractions or push
-a rebuild straight after deploying.
+```bash
+aws ssm delete-parameter --name /bench/access-token --region ap-southeast-2
+```
 
 ## Before every subsequent deploy
 
