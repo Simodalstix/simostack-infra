@@ -257,15 +257,16 @@ breakage window, not a regression.
       parameter costs nothing to hold.
 - [ ] Leave `VITE_BENCH_ACCESS_TOKEN` in `vue-simostack` alone. Phase 3 retires
       it there, when the login UI replaces it.
-- [x] **Retired in Phase 4 on 2026-09-01**: the `BenchAccessTokenParameterName`
-      template parameter and the `BENCH_ACCESS_TOKEN` environment variable are
-      out of `../bench-extract/template.yaml`, the access token and rotation
-      sections are cut from `../bench-extract/README.md`, and `../SECURITY.md`
-      is recalibrated. **The `/bench/access-token` SSM parameter is deleted
-      separately from that deploy**, because an
+- [ ] **Retire in Phase 4**, not before: delete the template parameter, the
+      environment variable and the SSM parameter itself, and cut the access
+      token and rotation sections from `../bench-extract/README.md`, in the same
+      change that recalibrates `SECURITY.md`. **The SSM parameter is a separate
+      step from that deploy**, and the ordering is the point: an
       `AWS::SSM::Parameter::Value<String>` is a deploy-time lookup rather than a
-      stack resource: the template change does not touch it, and rollback stays
-      a single deploy for as long as it is left in place.
+      stack resource, so dropping it from the template does not delete it, and
+      rollback stays a single deploy for exactly as long as it is left in place.
+      Delete it last, once you are confident there is no rollback.
+      (Phase 4 ran on 2026-09-01; the record is in `../CLAUDE.md`.)
 
 ## Phase 3 checklist
 
