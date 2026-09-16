@@ -8,13 +8,14 @@ AWSTemplateFormatVersion: '2010-09-09'
 # with the sibling service; it handles a plain CFN template fine, there is just
 # no `sam build` step. See README.
 #
-# Cognito authentication for Bench. Replaces the shared x-bench-token header
-# that bench-extract checks today.
+# Cognito authentication for Bench. Replaced the shared x-bench-token header;
+# authentication phases 1–4 are complete. See ../BENCH-ROADMAP.md.
 #
 # THE CONSTRAINT THIS TEMPLATE EXISTS TO HOLD:
 #
-#   The authenticated role below gets lambda:InvokeFunctionUrl and nothing
-#   else. It must never be granted bedrock:InvokeModel.
+#   The authenticated role below gets lambda:InvokeFunctionUrl and
+#   lambda:InvokeFunction, scoped to the IAM-authenticated Function URL.
+#   It must never be granted bedrock:InvokeModel.
 #
 # Three of the four layers bounding Bedrock spend are properties of the
 # bench-extract function or its execution role: ReservedConcurrentExecutions,
@@ -25,7 +26,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 # the enforcement budget attached to a role nobody is using. The Lambda stays
 # the only caller of Bedrock. See ../SECURITY.md and ./README.md.
 #
-# Nothing here has been deployed. No AWS resources exist for this stack yet.
+# Deployed as bench-auth in ap-southeast-2 since 2026-08-25.
 
 Description: >
   Bench authentication: Cognito User Pool with Google federation, an Identity
@@ -206,9 +207,9 @@ Resources:
 
   # The whole authorization model, in one policy.
   #
-  # lambda:InvokeFunctionUrl and nothing else. NOT bedrock:InvokeModel -- see
-  # the header comment. If this policy ever grows a Bedrock action, the role
-  # must also be added to the Roles: list of BenchBudgetAction in
+  # lambda:InvokeFunctionUrl plus lambda:InvokeFunction, URL-only. No Bedrock
+  # access -- see the header comment. If this policy ever grows a Bedrock
+  # action, the role must also be added to the Roles: list of BenchBudgetAction in
   # bench-extract/template.yaml, or the enforcement budget stops being able to
   # stop anything.
   BenchAuthenticatedRole:
@@ -266,7 +267,7 @@ Resources:
                     'lambda:InvokedViaFunctionUrl': true
 
         # Belt and braces on the constraint in the header comment. The Allow
-        # above grants lambda:InvokeFunctionUrl and nothing else, so this Deny
+        # above grants only the two Function URL invocation actions, so this Deny
         # changes no behaviour today. It is here because an explicit Deny cannot
         # be overridden by any later Allow, from this template or from a policy
         # attached out of band: a change that grants this role Bedrock access

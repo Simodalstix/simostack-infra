@@ -12,7 +12,15 @@ repo is deployed by that pipeline, and nothing here is deployed by CI at all.
 | Directory       | What it is                                        | State           |
 | --------------- | ------------------------------------------------- | --------------- |
 | `bench-extract` | Lambda + Function URL. Listing extraction via Bedrock. | Deployed, live |
-| `bench-auth`    | Cognito setup for Bench auth.                     | Placeholder, not built |
+| `bench-auth`    | Cognito setup for Bench auth.                     | Deployed; authentication phases 1–4 complete |
+
+## Bench status and next work
+
+[BENCH-ROADMAP.md](./BENCH-ROADMAP.md) records the completed authentication
+phases, current product gaps, and proposed next milestones. Authentication
+cleanup completed on 2026-09-13. Bench scoring, reliable URL import, an
+expandable account menu, and account-backed storage are separate unfinished
+features; completing authentication did not complete the product.
 
 ## Before adding a public endpoint
 
@@ -58,9 +66,10 @@ does not error: the site keeps calling the old URL and every extraction fails
 as a network error that looks like a Lambda fault.
 
 `bench-extract/README.md` has the full procedure. The short version is that the
-URL and access token get set by hand as GitHub Actions secrets on
-`vue-simostack`, and `scripts/post-deploy.sh` in that repo checks the local
-`.env` against the deployed stack.
+Function URL and Cognito configuration get set by hand as GitHub Actions
+secrets on `vue-simostack`, and `scripts/post-deploy.sh` in that repo checks
+the local `.env` against the deployed stack. The shared access token is
+retired; requests use Cognito credentials and SigV4 signing.
 
 ## History
 

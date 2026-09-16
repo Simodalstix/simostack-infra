@@ -4,14 +4,16 @@ Cognito authentication for Bench: a User Pool with Google federation, an
 Identity Pool, and an authenticated IAM role scoped to invoking the
 bench-extract Function URL.
 
-**Phases 1 and 2 are deployed and verified end-to-end.** Phase 1 deployed
+**Authentication phases 1–4 are complete.** Phase 1 deployed
 2026-08-25 and verified 2026-08-27, as the stack `bench-auth` in
 `ap-southeast-2`; Phase 2 -- the bench-extract cutover to `AuthType: AWS_IAM`
 with id_token attribution -- deployed and verified 2026-08-29, `verify-e2e.sh`
-12/12. Phases 3 and 4 have not started -- only Phase 3's entry gate, the User
-Pool's `DeletionProtection: ACTIVE`, is deployed (2026-08-30) -- so the
-deployed frontend is still broken by design. See "Verifying" below for what the
-verification does and does not cover.
+12/12. Phase 3 shipped the frontend Google login and SigV4 signing; the User
+Pool's `DeletionProtection: ACTIVE` was deployed on 2026-08-30. Phase 4's
+shared-token cleanup was deployed and checked on 2026-09-13, including
+deletion of the obsolete SSM parameter. This does not mean listing scoring or
+URL import is complete. See [the Bench roadmap](../BENCH-ROADMAP.md) for
+product status and next milestones, and "Verifying" below for the auth checks.
 
 ## What this replaces
 
@@ -20,7 +22,8 @@ Bench used to authenticate with a single shared access token
 readable by anyone who loaded the site. It was not a secret and was never
 treated as one. **That is done: the handler stopped reading it at the Phase 2
 cutover on 2026-08-29, and Phase 4 retired the parameter and the environment
-variable on 2026-09-01** -- see "Access token (retired in Phase 4)" in
+variable in code on 2026-09-01 and in AWS on 2026-09-13** -- see
+"Access token (retired in Phase 4)" in
 [`../bench-extract/README.md`](../bench-extract/README.md), kept there for why
 it has no rotation successor.
 
@@ -37,8 +40,9 @@ rather than replace.
 ## The constraint this service exists to hold
 
 **The Lambda stays the only thing that calls Bedrock.** The authenticated
-Identity Pool role gets `lambda:InvokeFunctionUrl` on the one function ARN and
-nothing else. It never gets `bedrock:InvokeModel`.
+Identity Pool role gets `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction`
+on the one function ARN, restricted to the IAM-authenticated Function URL.
+It never gets `bedrock:InvokeModel`.
 
 This is the reason the design looks the way it does. Three of the four layers
 bounding Bedrock spend are properties of the bench-extract function or its
@@ -110,19 +114,27 @@ boundary rather than a placeholder.
      `x-bench-id-token` instead. `verify-e2e.sh` step 6 is the check, and it
      now reads the logged sub back and matches it against the token's own.
 3. **vue-simostack**: login UI, SigV4 signing on the call, retire
-   `VITE_BENCH_ACCESS_TOKEN`. See "Phase 3 checklist" below before writing the
-   signing code -- the id_token header has an ordering requirement relative to
-   the signer that is easy to get wrong and impossible to see from the
-   response.
+   `VITE_BENCH_ACCESS_TOKEN` from the request path. **Shipped and verified live
+   before Phase 4 was authored on 2026-09-01.** See "Phase 3 checklist" below
+   for the signing procedure. Old frontend environment/Actions-secret cleanup
+   was previously recorded as in flight; its completion has not been checked
+   in this repo and is not required for authentication to work.
    - [x] **Entry gate, cleared 2026-08-30:** `DeletionProtection` on the User
      Pool went `INACTIVE` → `ACTIVE` and was deployed as an in-place update,
      no replacement. `INACTIVE` was the right setting through Phases 1 and 2,
      while the pool held only test accounts and might need tearing down;
      shipping the login UI is the moment it starts holding real users, and
      deleting a user pool deletes its users unrecoverably.
-4. **Recalibrate and update `SECURITY.md`**: "the shared token is not
-   authentication" closes as a gap; "open sign-up means anyone can spend the
-   budget" opens in its place.
+4. **Retire the shared token and update `SECURITY.md`**: remove the template
+   parameter, Lambda environment variable, and `/bench/access-token` SSM
+   parameter. **Authored 2026-09-01; deployed and verified 2026-09-13.**
+   `sam-app` is `UPDATE_COMPLETE`, the token parameter and environment variable
+   are absent, and an SSM metadata lookup returns no matching parameter.
+   `AWS_IAM` and the Function URL are unchanged. Open Google sign-up still
+   allows any signed-in user to spend the shared budget.
+
+These are the completed authentication phases. Proposed product milestones
+continue in [BENCH-ROADMAP.md](../BENCH-ROADMAP.md).
 
 ## Phase 2 checklist
 
@@ -243,9 +255,9 @@ evaluates identity policies only, cannot see the function's resource-based
 policy, and will report `allowed` for `lambda:InvokeFunctionUrl` while the call
 fails for want of `lambda:InvokeFunction`. Simulate **both** actions.
 
-From here until Phase 3 ships, the deployed frontend is broken: it still sends
-`x-bench-token` and now gets a 403 on every extraction. That is the accepted
-breakage window, not a regression.
+Historically, between this cutover and Phase 3 shipping, the frontend still
+sent `x-bench-token` and received a 403 on every extraction. That accepted
+breakage window is now closed.
 
 ### D. What does not change in Phase 2: the access token
 
@@ -266,7 +278,7 @@ breakage window, not a regression.
       stack resource, so dropping it from the template does not delete it, and
       rollback stays a single deploy for exactly as long as it is left in place.
       Delete it last, once you are confident there is no rollback.
-      (Phase 4 ran on 2026-09-01; the record is in `../CLAUDE.md`.)
+      (Phase 4 was authored on 2026-09-01 and completed on 2026-09-13.)
 
 ## Phase 3 checklist
 
@@ -274,14 +286,17 @@ Phase 3 is work in `vue-simostack`, not here, but the constraints it has to
 meet are properties of what this repo deployed, so they are written down here
 rather than rediscovered there.
 
+**The login and signing implementation has shipped.** Like Phase 2's checklist,
+the unticked boxes below preserve a procedure, not an implementation backlog.
+Removal of any unused frontend environment/Actions secret remains unverified.
+
 ### Entry gate, before any login UI ships -- cleared 2026-08-30
 
 - [x] `DeletionProtection` on the User Pool is `ACTIVE`, deployed in place with
       no replacement. `INACTIVE` was right through Phases 1 and 2, while the
       pool held only test accounts; shipping login is the moment it starts
       holding real users, and deleting a user pool deletes its users
-      unrecoverably. Nothing else in Phase 3 was blocked on this, so the rest of
-      this checklist is still open work in `vue-simostack`.
+      unrecoverably. The frontend login and signing work subsequently shipped.
 
 ### Signing the call
 
@@ -318,7 +333,7 @@ same as the Function URL handoff.
       Actions secrets once the login flow replaces it. In flight as of
       2026-09-01. Nothing is blocked on it in either direction: the handler has
       not read the header since 2026-08-29, and the infra side of the retirement
-      (Phase 4) is done regardless of when this lands.
+      (Phase 4) was deployed on 2026-09-13 regardless of when this lands.
 
 ### CORS
 
@@ -420,8 +435,8 @@ guided mode offers to save every parameter into it. Say **no** to saving
 parameters, or edit `GoogleClientSecret` back out of `parameter_overrides`
 afterwards, and pass it on the command line on each deploy instead.
 
-This is a weaker story than the bench-extract access token, which is held in SSM
-and resolved by CloudFormation so it is never typed at a prompt. That pattern
+The retired bench-extract access token was held in SSM and resolved by
+CloudFormation, so it was never typed at a prompt. That historical pattern
 does not transfer directly: `AWS::SSM::Parameter::Value<String>` cannot read a
 `SecureString`, and `{{resolve:ssm-secure}}` is restricted to an allowlist of
 resource properties. Whether `AWS::Cognito::UserPoolIdentityProvider`'s
@@ -487,13 +502,12 @@ credentials cannot be obtained headlessly.
 Note that under `AuthType: NONE` the unsigned probe is a real invocation and
 costs a real Bedrock call.
 
-## Not yet done
+## Verification limits and remaining housekeeping
 
-- Phases 1 and 2 are deployed and verified end-to-end (2026-08-25/27 and
-  2026-08-29). Phases 3 and 4 have not started, so the deployed frontend stays
-  broken by design until the login UI ships. The one piece of Phase 3 that is
-  done is its entry gate: `DeletionProtection` on the User Pool is `ACTIVE` as
-  of 2026-08-30.
+- Authentication phases 1–4 are complete. The 2026-09-13 check verified AWS
+  configuration and SSM deletion; it did not rerun the browser-based 12/12
+  authentication suite. Product work is tracked in
+  [BENCH-ROADMAP.md](../BENCH-ROADMAP.md).
 - `bedrock:InvokeModel` is now proven denied by an observed live refusal, not
   only by `simulate-principal-policy`: the 2026-08-29 run passed step 4 with
   `--cli-binary-format raw-in-base64-out` in place, so the call reached Bedrock

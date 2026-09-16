@@ -5,10 +5,13 @@ Backend for Bench's "+ Add listing" flow. One Lambda behind a Function URL
 realestate.com.au URL it fetches server-side, it asks Claude Haiku (via Amazon
 Bedrock) for structured listing facts as JSON.
 
-**Pasted text is the working input.** Both allowlisted sites block server-side
-fetching at the CDN edge, so the URL path returns `URL_FETCH_BLOCKED` every
-time and the UI leads with paste. The allowlist comment in `index.mjs` has the
-evidence and what it would take to fix; it is not repeated here.
+**Pasted text is the currently working input; reliable URL import is unfinished.**
+The recorded 2026-08-08 checks found both allowlisted sites blocking the
+server-side fetch at the CDN edge. The URL path reports `URL_FETCH_BLOCKED`
+when retrieval fails, and the UI leads with paste. This is a workaround, not
+the intended final experience. [BENCH-ROADMAP.md](../BENCH-ROADMAP.md) records
+the URL import investigation and its acceptance criteria; `index.mjs` retains
+the original fetch evidence.
 
 `index.mjs` is the request/response contract. Its consumer lives in the
 frontend repo (`vue-simostack`) at `src/components/bench/AddListingFlow.vue`.
@@ -207,11 +210,10 @@ Two prompts are worth knowing about in advance:
 If one ever gains a `RoleName` or `ManagedPolicyName`, CloudFormation starts
 demanding `CAPABILITY_NAMED_IAM` instead, and the error does not explain why.
 
-Saving answers to `samconfig.toml` is worth doing: it makes subsequent deploys
-a bare `sam build && sam deploy` with the capability already recorded. What it
-saves is the SSM parameter's name, never the token, since the token is only
-ever resolved by CloudFormation at deploy time. The file stays gitignored
-anyway, because it records the stack name, region and alert email.
+Saving answers to `samconfig.toml` makes subsequent deploys a bare
+`sam build && sam deploy` with the capability already recorded. The current
+template has no access-token or SSM lookup parameter. The file stays
+gitignored because it records the stack name, region and alert email.
 
 ### After deploy
 
@@ -326,7 +328,7 @@ and nothing will tell you if you skip it.
 - Confirm `Cors.AllowOrigins` in `template.yaml` matches the real deployed
   domains (currently `simostack.com` / `www.simostack.com`).
 
-## Access token (retired in Phase 4, 2026-09-01)
+## Access token (Phase 4 completed 2026-09-13)
 
 There is no longer one, and nothing here rotates. `BenchAccessToken` was a
 shared string in SSM (`/bench/access-token`) that the frontend sent as
@@ -335,7 +337,11 @@ shared string in SSM (`/bench/access-token`) that the frontend sent as
 filtered bots and did nothing else. The handler stopped reading it at the Phase
 2 cutover on 2026-08-29, when the Function URL moved to `AuthType: AWS_IAM`,
 and Phase 4 removed the `BenchAccessTokenParameterName` template parameter and
-the `BENCH_ACCESS_TOKEN` environment variable.
+the `BENCH_ACCESS_TOKEN` environment variable. That cleanup was authored on
+2026-09-01 and deployed to `sam-app` on 2026-09-13. Read-only AWS checks
+confirmed both are absent, the Lambda update succeeded, and `AWS_IAM` and
+the Function URL are unchanged. The user then deleted `/bench/access-token`;
+an SSM metadata lookup confirmed its absence the same day.
 
 What replaced it is not another header to rotate. Callers are SigV4-signed with
 short-lived credentials from the bench-auth Identity Pool, and identify
@@ -347,9 +353,11 @@ store, publish or roll. See [`../bench-auth/README.md`](../bench-auth/README.md)
 **Deleting the SSM parameter is a separate step from the deploy, on purpose.**
 `AWS::SSM::Parameter::Value<String>` is a deploy-time lookup, not a stack
 resource, so dropping it from `template.yaml` leaves `/bench/access-token`
-sitting in Parameter Store untouched. While it sits there, a rollback to the
-pre-Phase-4 template is a single deploy. Delete it only once you are confident
-you will not roll back:
+sitting in Parameter Store untouched. The separate deletion below has now
+been completed. Restoring a template that depends on it would also require
+recreating the parameter; it is no longer a single-deploy rollback.
+
+Historical cleanup command:
 
 ```bash
 aws ssm delete-parameter --name /bench/access-token --region ap-southeast-2
