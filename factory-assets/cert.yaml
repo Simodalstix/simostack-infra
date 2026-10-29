@@ -1,0 +1,26 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Certificate for the /factory asset host. CloudFront only accepts ACM certificates from
+  us-east-1, so this stack (factory-assets-cert) is deployed there. Draft: not deployed.
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: assets.simostack.com
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 hosted zone for simostack.com. ACM writes its validation record there.
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+Outputs:
+  CertificateArn:
+    Value: !Ref Certificate

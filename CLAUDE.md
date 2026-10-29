@@ -9,6 +9,8 @@ design.
   and deployed.
 - `bench-auth/`: Cognito auth for Bench, replacing the shared `x-bench-token`
   header. All four phases are deployed and verified.
+- `factory-assets/`: private bucket and CloudFront distribution for the
+  vue-simostack /factory artwork. Plain CloudFormation, no Lambda.
 - `DEPLOYED.md`: live resource state, verification dates, the phase record and
   the kill-switch drill. Everything in this repo that carries a date lives
   there, so that this file can stay conventions only.
